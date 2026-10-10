@@ -9,9 +9,12 @@ A lightweight Windows screenshot tool. Hold both mouse buttons and drag to captu
 
 **[Download Duo Click for Windows](https://github.com/DylanZhangzzz/DuoClick/releases/latest)**
 
-Choose the `DuoClick-…-Windows.zip` file, extract it, and open `DuoClick.exe`. Keep `DuoClick.exe.config` beside the program. No installer is needed.
+- **Installer:** download `DuoClick-…-Setup.exe`. It installs for your Windows account without administrator privileges, adds a Start menu shortcut, and offers optional launch at sign-in (off by default). The installer supports English and Simplified Chinese.
+- **Portable:** download `DuoClick-…-Windows.zip`, extract it, and open `DuoClick.exe`. Keep `DuoClick.exe.config` beside the program. No installation is needed.
 
 Requires Windows 10 / 11 and .NET Framework 4.8.
+
+To update an installed copy, exit Duo Click from its tray menu and run the newer installer. Your language and capture-limit settings are kept. To uninstall, use Windows **Settings → Apps → Installed apps → Duo Click**. Uninstall removes the program and its startup entry but keeps your preferences in `%LocalAppData%\DuoClick` for a future reinstall. The portable copy uses the same preferences.
 
 ## Take a screenshot
 

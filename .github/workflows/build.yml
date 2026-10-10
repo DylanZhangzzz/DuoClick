@@ -8,17 +8,31 @@ permissions:
   contents: read
 jobs:
   windows:
-    runs-on: windows-latest
+    runs-on: windows-2025
     steps:
       - uses: actions/checkout@v4
       - name: Build and test
         shell: powershell
         run: .\build.ps1 -Test
+      - name: Build installer
+        shell: powershell
+        run: .\build-installer.ps1
+      - name: Verify install, repair and uninstall
+        shell: powershell
+        run: .\tests\InstallerSmoke.ps1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: DuoClick-Installer-Logs
+          path: dist/installer-logs/
+          if-no-files-found: ignore
       - uses: actions/upload-artifact@v4
         with:
           name: DuoClick-Windows
+          if-no-files-found: error
           path: |
             dist/DuoClick.exe
             dist/DuoClick.exe.config
             dist/DuoClick-*-Windows.zip
+            dist/DuoClick-*-Setup.exe
             dist/*.sha256

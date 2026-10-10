@@ -9,9 +9,12 @@
 
 **[下载 Windows 版 Duo Click](https://github.com/DylanZhangzzz/DuoClick/releases/latest)**
 
-选择 `DuoClick-…-Windows.zip`，解压后打开 `DuoClick.exe` 即可，无需安装。请将 `DuoClick.exe.config` 与程序保存在同一个文件夹。
+- **安装版**：下载 `DuoClick-…-Setup.exe`，无需管理员权限，为当前 Windows 用户安装并添加开始菜单入口。可选“登录 Windows 时启动”，默认不勾选。安装向导支持中文和英文。
+- **免安装版**：下载 `DuoClick-…-Windows.zip`，解压后打开 `DuoClick.exe` 即可。请将 `DuoClick.exe.config` 与程序保存在同一个文件夹。
 
 支持 Windows 10 / 11，需要 .NET Framework 4.8。
+
+更新安装版时，先从托盘退出 Duo Click，再运行新版安装包，语言和截图上限设置会保留。卸载时，在 Windows **设置 → 应用 → 已安装的应用 → Duo Click** 中操作。卸载会移除程序和开机启动项，但保留 `%LocalAppData%\DuoClick` 中的偏好设置，方便以后重新安装。免安装版也使用这份设置。
 
 ## 开始截屏
 
