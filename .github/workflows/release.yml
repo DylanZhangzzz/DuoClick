@@ -1,0 +1,64 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  release:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Build and test tagged version
+        shell: powershell
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if ($env:RELEASE_TAG -cnotmatch '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
+            throw 'Release tags must use vMAJOR.MINOR.PATCH, for example v0.1.0.'
+          }
+          .\build.ps1 -Test -Version $env:RELEASE_TAG.Substring(1)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DuoClick-${{ github.ref_name }}-Windows
+          if-no-files-found: error
+          path: |
+            dist/DuoClick.exe
+            dist/DuoClick.exe.config
+            dist/DuoClick-*-Windows.zip
+            dist/*.sha256
+      - name: Publish release with binaries
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          $tag = $env:RELEASE_TAG
+          $version = $tag.Substring(1)
+          $zip = "dist/DuoClick-$version-Windows.zip"
+          if (-not (Test-Path -LiteralPath $zip)) { throw 'Release ZIP is missing.' }
+          $checksums = @(Get-ChildItem -LiteralPath dist -Filter '*.sha256' | ForEach-Object { $_.FullName })
+          if ($checksums.Count -eq 0) { throw 'Release checksum is missing.' }
+          $releases = gh release list --limit 100 --json tagName,isDraft
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to inspect existing releases.' }
+          $existing = @($releases | ConvertFrom-Json) | Where-Object { $_.tagName -ceq $tag }
+          if ($existing) {
+            if (-not $existing.isDraft) {
+              throw 'This version is already published. Use a new version tag instead of replacing its binaries.'
+            }
+          } else {
+            gh release create $tag --verify-tag --draft --title "Duo Click $tag" --generate-notes
+            if ($LASTEXITCODE -ne 0) { throw 'Failed to create draft release.' }
+          }
+          gh release upload $tag $zip 'dist/DuoClick.exe' 'dist/DuoClick.exe.config' @checksums --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to upload release assets; release remains a draft.' }
+          gh release edit $tag --draft=false
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to publish release.' }

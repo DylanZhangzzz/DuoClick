@@ -24,9 +24,28 @@
 powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1 -Test
 ```
 
-输出位于 `dist/`。分发时请一起保留 `DuoClick.exe` 和 `DuoClick.exe.config`。
+版本号保存在根目录的 `VERSION` 文件中，格式为不带前缀的 `MAJOR.MINOR.PATCH`，例如 `0.1.0`。本地构建默认使用该版本，也可临时指定版本：
 
-GitHub Actions 会在推送后构建并运行测试，可在成功的 **Build** 工作流页面下载 `DuoClick-Windows` 构建产物。
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1 -Test -Version 0.1.0
+```
+
+构建会在 `dist/` 中生成 `DuoClick.exe`、版本元数据、测试程序（使用 `-Test` 时）以及 `DuoClick-<版本>-Windows.zip` 和对应的 `.sha256` 校验文件。ZIP 包含程序、配置文件和本 README。发布时推送形如 `v0.1.0` 的版本标签，GitHub Actions 会构建并发布 ZIP 到 GitHub Releases；用户可从该版本的 Releases 页面下载。
+
+### 发布新版本
+
+先把 `VERSION` 改为新版本号并推送提交，然后为该提交创建同号标签。例如发布 `0.1.1`：
+
+```powershell
+Set-Content -NoNewline -Path .\VERSION -Value '0.1.1'
+git add VERSION
+git commit -m "Release v0.1.1"
+git push
+git tag v0.1.1
+git push origin v0.1.1
+```
+
+用户可在 [GitHub Releases](https://github.com/DylanZhangzzz/DuoClick/releases/latest) 下载最新 ZIP。
 
 ## 交互说明
 
