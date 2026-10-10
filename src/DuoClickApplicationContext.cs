@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Imaging;
+using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Windows.Forms;
@@ -15,9 +16,20 @@ namespace DuoClick
         private readonly GestureState _gesture;
         private readonly NotifyIcon _trayIcon;
         private readonly ContextMenuStrip _contextMenu;
+        private readonly ToolStripMenuItem _headerItem;
         private readonly ToolStripMenuItem _pauseItem;
+        private readonly ToolStripMenuItem _languageItem;
+        private readonly ToolStripMenuItem _englishItem;
+        private readonly ToolStripMenuItem _simplifiedChineseItem;
+        private readonly ToolStripMenuItem _helpItem;
+        private readonly ToolStripMenuItem _exitItem;
         private readonly WinFormsTimer _selectionTimer;
+        private readonly WinFormsTimer _trayFeedbackTimer;
         private readonly ClipboardCopyQueue _clipboardQueue;
+        private readonly string _languageSettingsPath;
+        private readonly TrayStatusModel _trayStatus;
+        private readonly Icon _trayIconImage;
+        private readonly bool _loadedEmbeddedIcon;
         private readonly HashSet<long> _invalidSessions;
         private readonly Queue<SelectionStartRequest> _pendingStarts;
         private LowLevelInputHooks _hooks;
@@ -33,6 +45,7 @@ namespace DuoClick
         private bool _exitPending;
         private bool _closing;
         private long _latestClipboardSessionId;
+        private AppLanguage _language;
 
         internal DuoClickApplicationContext()
             : this(true, true)
@@ -42,7 +55,19 @@ namespace DuoClick
         // Internal switches keep the integration test seam independent of global
         // hooks and the user's notification area.
         internal DuoClickApplicationContext(bool installHooks, bool showTrayIcon)
+            : this(installHooks, showTrayIcon, AppLanguageSettings.DefaultPath)
         {
+        }
+
+        internal DuoClickApplicationContext(bool installHooks, bool showTrayIcon,
+            string languageSettingsPath)
+        {
+            _languageSettingsPath = languageSettingsPath;
+            LanguageLoadResult languageLoad = AppLanguageSettings.Load(languageSettingsPath,
+                CultureInfo.CurrentUICulture);
+            _language = languageLoad.Language;
+            _trayStatus = new TrayStatusModel(_language);
+
             _gesture = new GestureState();
             _invalidSessions = new HashSet<long>();
             _pendingStarts = new Queue<SelectionStartRequest>();
@@ -54,24 +79,45 @@ namespace DuoClick
             _selectionTimer.Interval = 16;
             _selectionTimer.Tick += OnSelectionTimerTick;
 
+            _trayFeedbackTimer = new WinFormsTimer();
+            _trayFeedbackTimer.Interval = 2000;
+            _trayFeedbackTimer.Tick += OnTrayFeedbackTimerTick;
+
             _clipboardQueue = new ClipboardCopyQueue(OnClipboardCopied, OnClipboardFailed);
 
-            _pauseItem = new ToolStripMenuItem("暂停截屏");
+            _headerItem = new ToolStripMenuItem();
+            _headerItem.Enabled = false;
+            _pauseItem = new ToolStripMenuItem();
             _pauseItem.Click += OnPauseClick;
-            ToolStripMenuItem helpItem = new ToolStripMenuItem("使用说明");
-            helpItem.Click += OnHelpClick;
-            ToolStripMenuItem exitItem = new ToolStripMenuItem("退出");
-            exitItem.Click += OnExitClick;
+            _languageItem = new ToolStripMenuItem();
+            _englishItem = new ToolStripMenuItem();
+            _englishItem.Click += delegate { ChangeLanguage(AppLanguage.English); };
+            _simplifiedChineseItem = new ToolStripMenuItem();
+            _simplifiedChineseItem.Click += delegate
+            {
+                ChangeLanguage(AppLanguage.SimplifiedChinese);
+            };
+            _languageItem.DropDownItems.Add(_englishItem);
+            _languageItem.DropDownItems.Add(_simplifiedChineseItem);
+            _helpItem = new ToolStripMenuItem();
+            _helpItem.Click += OnHelpClick;
+            _exitItem = new ToolStripMenuItem();
+            _exitItem.Click += OnExitClick;
 
             _contextMenu = new ContextMenuStrip();
-            _contextMenu.Items.Add(_pauseItem);
-            _contextMenu.Items.Add(helpItem);
+            _contextMenu.Items.Add(_headerItem);
             _contextMenu.Items.Add(new ToolStripSeparator());
-            _contextMenu.Items.Add(exitItem);
+            _contextMenu.Items.Add(_pauseItem);
+            _contextMenu.Items.Add(_languageItem);
+            _contextMenu.Items.Add(_helpItem);
+            _contextMenu.Items.Add(new ToolStripSeparator());
+            _contextMenu.Items.Add(_exitItem);
+            UpdateMenuLanguage();
 
             _trayIcon = new NotifyIcon();
-            _trayIcon.Icon = SystemIcons.Application;
-            _trayIcon.Text = "Duo Click - Ready";
+            _trayIconImage = AppTrayIcon.Load(out _loadedEmbeddedIcon);
+            _trayIcon.Icon = _trayIconImage;
+            _trayIcon.Text = _trayStatus.Text;
             _trayIcon.ContextMenuStrip = _contextMenu;
             _trayIcon.Visible = showTrayIcon;
 
@@ -85,9 +131,14 @@ namespace DuoClick
                 }
                 catch (Exception ex)
                 {
-                    ShowNotice("全局快捷键启动失败：" + ex.Message, ToolTipIcon.Error);
+                    ShowNotice(AppLocalization.Get(_language, AppText.HookStartFailurePrefix) +
+                        ex.Message, ToolTipIcon.Error);
                 }
             }
+
+            if (languageLoad.Error != null)
+                ShowNotice(AppLocalization.Get(_language, AppText.LanguageLoadFailure),
+                    ToolTipIcon.Warning);
         }
 
         internal bool HasSelectionOverlayForTesting
@@ -98,6 +149,50 @@ namespace DuoClick
         internal bool HasPendingClipboardCopyForTesting
         {
             get { return _clipboardQueue.HasPendingItems; }
+        }
+
+        internal AppLanguage LanguageForTesting
+        {
+            get { return _language; }
+        }
+
+        internal string TrayTooltipForTesting
+        {
+            get { return _trayStatus.Text; }
+        }
+
+        internal bool LoadedEmbeddedIconForTesting
+        {
+            get { return _loadedEmbeddedIcon; }
+        }
+
+        internal void ChangeLanguageForTesting(AppLanguage language)
+        {
+            ChangeLanguage(language);
+        }
+
+        internal void SetPausedForTesting(bool paused)
+        {
+            _paused = paused;
+            _trayFeedbackTimer.Stop();
+            _trayStatus.SetPaused(paused);
+            _pauseItem.Text = AppLocalization.Get(_language,
+                paused ? AppText.Resume : AppText.Pause);
+            UpdateTrayTooltip();
+        }
+
+        internal void ShowCopiedFeedbackForTesting()
+        {
+            _trayStatus.ShowCopied();
+            UpdateTrayTooltip();
+            RestartTrayFeedbackTimer();
+        }
+
+        internal void ClearTooltipFeedbackForTesting()
+        {
+            _trayFeedbackTimer.Stop();
+            _trayStatus.ClearFeedback();
+            UpdateTrayTooltip();
         }
 
         private void BeginSelection(long sessionId, Point start)
@@ -118,7 +213,8 @@ namespace DuoClick
             Rectangle bounds = SystemInformation.VirtualScreen;
             if (bounds.Width <= 0 || bounds.Height <= 0)
             {
-                FailSelection(sessionId, "无法读取桌面尺寸。");
+                FailSelection(sessionId, AppLocalization.Get(_language,
+                    AppText.DesktopSizeFailure));
                 return;
             }
 
@@ -162,7 +258,8 @@ namespace DuoClick
             {
                 if (image != null)
                     image.Dispose();
-                FailSelection(sessionId, "截取桌面失败。 " + (error == null ? String.Empty : error.Message));
+                FailSelection(sessionId, AppLocalization.Get(_language,
+                    AppText.CaptureFailurePrefix) + (error == null ? String.Empty : error.Message));
                 return;
             }
 
@@ -170,7 +267,8 @@ namespace DuoClick
             _frozenDesktop = image;
             try
             {
-                _overlay = new SelectionOverlay(_frozenDesktop, _desktopBounds, _selectionStart);
+                _overlay = new SelectionOverlay(_frozenDesktop, _desktopBounds, _selectionStart,
+                    _language);
                 _overlay.Show();
                 _selectionTimer.Start();
 
@@ -183,7 +281,8 @@ namespace DuoClick
             }
             catch (Exception ex)
             {
-                FailSelection(sessionId, "显示选区失败。 " + ex.Message);
+                FailSelection(sessionId, AppLocalization.Get(_language,
+                    AppText.OverlayFailurePrefix) + ex.Message);
             }
         }
 
@@ -257,7 +356,8 @@ namespace DuoClick
                     {
                         if (result != null)
                             result.Dispose();
-                        ShowNotice("生成截图失败。", ToolTipIcon.Error);
+                        ShowNotice(AppLocalization.Get(_language, AppText.CropFailure),
+                            ToolTipIcon.Error);
                         return;
                     }
 
@@ -437,7 +537,10 @@ namespace DuoClick
                 return;
 
             _paused = !_paused;
-            _pauseItem.Text = _paused ? "恢复截屏" : "暂停截屏";
+            _trayFeedbackTimer.Stop();
+            _trayStatus.SetPaused(_paused);
+            UpdateMenuLanguage();
+            UpdateTrayTooltip();
             if (_paused)
             {
                 long session = _gesture.CancelCurrent();
@@ -445,22 +548,75 @@ namespace DuoClick
                     CancelSelection(session);
                 else if (_selectionSessionId != 0)
                     CancelSelection(_selectionSessionId);
-                ShowNotice("截屏已暂停。", ToolTipIcon.Info);
+                ShowNotice(AppLocalization.Get(_language, AppText.NoticePaused),
+                    ToolTipIcon.Info);
             }
             else
             {
-                ShowNotice("截屏已恢复。", ToolTipIcon.Info);
+                ShowNotice(AppLocalization.Get(_language, AppText.NoticeResumed),
+                    ToolTipIcon.Info);
                 ProcessQueuedStarts();
             }
         }
 
         private void OnHelpClick(object sender, EventArgs e)
         {
-            MessageBox.Show(
-                "同时按住鼠标左键和右键。按下第二个键时会冻结桌面并开始选区。\r\n" +
-                "拖动鼠标后松开两个键，选区会复制到剪贴板。按 Esc 可取消。\r\n\r\n" +
-                "组合键中的第二个按键会被截屏功能拦截；第一个按键会照常传递。",
-                "Duo Click 使用说明", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            MessageBox.Show(this.MainForm,
+                AppLocalization.Get(_language, AppText.HelpBody),
+                AppLocalization.Get(_language, AppText.HelpTitle),
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+
+        private void ChangeLanguage(AppLanguage language)
+        {
+            if (_closing || _exitPending)
+                return;
+
+            _language = language;
+            _trayStatus.SetLanguage(language);
+            UpdateMenuLanguage();
+            if (_overlay != null)
+                _overlay.SetLanguage(language);
+            UpdateTrayTooltip();
+
+            Exception saveError;
+            if (!AppLanguageSettings.TrySave(_languageSettingsPath, language, out saveError))
+                ShowNotice(AppLocalization.Get(_language, AppText.LanguageSaveFailure),
+                    ToolTipIcon.Warning);
+        }
+
+        private void UpdateMenuLanguage()
+        {
+            _headerItem.Text = AppLocalization.Get(_language, AppText.TrayHeader);
+            _pauseItem.Text = AppLocalization.Get(_language,
+                _paused ? AppText.Resume : AppText.Pause);
+            _languageItem.Text = AppLocalization.Get(_language, AppText.LanguageMenu);
+            _englishItem.Text = AppLocalization.Get(_language, AppText.English);
+            _englishItem.Checked = _language == AppLanguage.English;
+            _simplifiedChineseItem.Text = AppLocalization.Get(_language,
+                AppText.SimplifiedChinese);
+            _simplifiedChineseItem.Checked = _language == AppLanguage.SimplifiedChinese;
+            _helpItem.Text = AppLocalization.Get(_language, AppText.Help);
+            _exitItem.Text = AppLocalization.Get(_language, AppText.Exit);
+        }
+
+        private void UpdateTrayTooltip()
+        {
+            if (_trayIcon != null)
+                _trayIcon.Text = _trayStatus.Text;
+        }
+
+        private void RestartTrayFeedbackTimer()
+        {
+            _trayFeedbackTimer.Stop();
+            _trayFeedbackTimer.Start();
+        }
+
+        private void OnTrayFeedbackTimerTick(object sender, EventArgs e)
+        {
+            _trayFeedbackTimer.Stop();
+            _trayStatus.ClearFeedback();
+            UpdateTrayTooltip();
         }
 
         private void OnExitClick(object sender, EventArgs e)
@@ -507,8 +663,11 @@ namespace DuoClick
             }
             _clipboardQueue.Dispose();
             _selectionTimer.Dispose();
+            _trayFeedbackTimer.Stop();
+            _trayFeedbackTimer.Dispose();
             _trayIcon.Visible = false;
             _trayIcon.Dispose();
+            _trayIconImage.Dispose();
             _contextMenu.Dispose();
             _dispatcher.Dispose();
         }
@@ -517,22 +676,32 @@ namespace DuoClick
         {
             if (_closing)
                 return;
-            _trayIcon.Text = "Duo Click - Copied";
-            ShowNotice("截图已复制到剪贴板。", ToolTipIcon.Info);
+            _trayStatus.ShowCopied();
+            UpdateTrayTooltip();
+            RestartTrayFeedbackTimer();
+            ShowNotice(AppLocalization.Get(_language, AppText.NoticeCopied), ToolTipIcon.Info);
         }
 
         private void OnClipboardFailed()
         {
             if (_closing)
                 return;
-            ShowNotice("剪贴板正忙，截图未复制。", ToolTipIcon.Warning);
+            _trayStatus.ShowFailed();
+            UpdateTrayTooltip();
+            RestartTrayFeedbackTimer();
+            ShowNotice(AppLocalization.Get(_language, AppText.NoticeClipboardBusy),
+                ToolTipIcon.Warning);
         }
 
         private void ShowNotice(string text, ToolTipIcon icon)
         {
             if (_closing || !_trayIcon.Visible)
                 return;
-            try { _trayIcon.ShowBalloonTip(1400, "Duo Click", text, icon); }
+            try
+            {
+                _trayIcon.ShowBalloonTip(1400,
+                    AppLocalization.Get(_language, AppText.AppName), text, icon);
+            }
             catch (InvalidOperationException) { }
         }
 
@@ -552,7 +721,7 @@ namespace DuoClick
             _desktopBounds = desktopBounds;
             _selectionStart = start;
             _frozenDesktop = (Bitmap)image.Clone();
-            _overlay = new SelectionOverlay(_frozenDesktop, _desktopBounds, start);
+            _overlay = new SelectionOverlay(_frozenDesktop, _desktopBounds, start, _language);
             _overlay.Show();
             return session;
         }

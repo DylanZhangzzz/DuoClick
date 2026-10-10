@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Collections.Specialized;
 using System.Drawing;
 using System.IO;
+using System.Globalization;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -41,6 +42,11 @@ namespace DuoClick.Tests
             Run("selection geometry supports negative origins and reverse direction", GeometrySupportsNegativeOriginsAndReverseDirection);
             Run("selection geometry clips to desktop bounds", GeometryClipsToDesktopBounds);
             Run("selection minimum size is two pixels per side", GeometryEnforcesMinimumSize);
+            Run("localization catalog is complete and tray text fits Windows limits", LocalizationCatalogIsComplete);
+            Run("language settings choose system default and persist selections", LanguageSettingsPersistSelections);
+            Run("tray feedback restores ready or paused status", TrayFeedbackRestoresBaseStatus);
+            Run("language switch persists and restores localized paused status", LanguageSwitchPersistsAndRestoresTooltip);
+            Run("embedded tray icon resource is a valid ICO", EmbeddedTrayIconIsValid);
 
             if (args.Length == 1)
             {
@@ -53,6 +59,138 @@ namespace DuoClick.Tests
 
             Console.WriteLine("Tests: " + _passed + " passed, " + _failed + " failed.");
             return _failed == 0 ? 0 : 1;
+        }
+
+        private static void LocalizationCatalogIsComplete()
+        {
+            Assert(AppLocalization.HasCompleteCatalog,
+                "each supported language should define every user-facing string");
+
+            AppLanguage[] languages = new AppLanguage[]
+            {
+                AppLanguage.English,
+                AppLanguage.SimplifiedChinese
+            };
+            for (int i = 0; i < languages.Length; i++)
+            {
+                Assert(AppLocalization.Get(languages[i], AppText.TooltipReady).Length <= 63,
+                    "ready tooltip should fit NotifyIcon's text limit");
+                Assert(AppLocalization.Get(languages[i], AppText.TooltipPaused).Length <= 63,
+                    "paused tooltip should fit NotifyIcon's text limit");
+                Assert(AppLocalization.Get(languages[i], AppText.TooltipCopied).Length <= 63,
+                    "copied tooltip should fit NotifyIcon's text limit");
+                Assert(AppLocalization.Get(languages[i], AppText.TooltipFailed).Length <= 63,
+                    "failed tooltip should fit NotifyIcon's text limit");
+            }
+        }
+
+        private static void LanguageSettingsPersistSelections()
+        {
+            string directory = Path.Combine(Path.GetTempPath(), "DuoClickTests",
+                Guid.NewGuid().ToString("N"));
+            string path = Path.Combine(directory, "language.txt");
+            try
+            {
+                LanguageLoadResult missing = AppLanguageSettings.Load(path,
+                    new CultureInfo("zh-CN"));
+                AssertEqual(AppLanguage.SimplifiedChinese, missing.Language,
+                    "first run with Chinese UI culture should select Simplified Chinese");
+                Assert(missing.Error == null, "a missing language file should be expected");
+                AssertEqual(AppLanguage.English,
+                    AppLanguageSettings.GetSystemDefault(new CultureInfo("en-GB")),
+                    "non-Chinese UI culture should select English");
+
+                Exception error;
+                Assert(AppLanguageSettings.TrySave(path, AppLanguage.SimplifiedChinese, out error),
+                    "language preference should save: " + (error == null ? String.Empty : error.Message));
+                AssertEqual("zh-CN", File.ReadAllText(path), "saved language code");
+                LanguageLoadResult saved = AppLanguageSettings.Load(path,
+                    new CultureInfo("en-US"));
+                AssertEqual(AppLanguage.SimplifiedChinese, saved.Language,
+                    "saved language should take precedence over system culture");
+                Assert(saved.Error == null, "valid saved language should not report an error");
+            }
+            finally
+            {
+                if (Directory.Exists(directory))
+                    Directory.Delete(directory, true);
+            }
+        }
+
+        private static void TrayFeedbackRestoresBaseStatus()
+        {
+            TrayStatusModel status = new TrayStatusModel(AppLanguage.English);
+            AssertEqual(AppLocalization.Get(AppLanguage.English, AppText.TooltipReady),
+                status.Text, "initial tray tooltip should explain the gesture");
+            status.ShowCopied();
+            AssertEqual(AppLocalization.Get(AppLanguage.English, AppText.TooltipCopied),
+                status.Text, "copy feedback should be visible temporarily");
+            status.ClearFeedback();
+            AssertEqual(AppLocalization.Get(AppLanguage.English, AppText.TooltipReady),
+                status.Text, "copy feedback should restore ready status");
+
+            status.SetPaused(true);
+            status.ShowCopied();
+            AssertEqual(AppLocalization.Get(AppLanguage.English, AppText.TooltipCopied),
+                status.Text, "copy feedback should appear while paused");
+            status.ClearFeedback();
+            AssertEqual(AppLocalization.Get(AppLanguage.English, AppText.TooltipPaused),
+                status.Text, "copy feedback should restore paused status");
+            status.SetLanguage(AppLanguage.SimplifiedChinese);
+            AssertEqual(AppLocalization.Get(AppLanguage.SimplifiedChinese,
+                AppText.TooltipPaused), status.Text,
+                "language switching should immediately localize the current status");
+        }
+
+        private static void EmbeddedTrayIconIsValid()
+        {
+            using (Icon icon = AppTrayIcon.TryLoadEmbedded(Assembly.GetExecutingAssembly()))
+            {
+                Assert(icon != null,
+                    "test and app builds should embed DuoClick.AppIcon.ico");
+                Assert(icon.Width > 0 && icon.Height > 0,
+                    "embedded ICO should expose valid dimensions");
+            }
+        }
+
+        private static void LanguageSwitchPersistsAndRestoresTooltip()
+        {
+            string directory = Path.Combine(Path.GetTempPath(), "DuoClickTests",
+                Guid.NewGuid().ToString("N"));
+            string path = Path.Combine(directory, "language.txt");
+            DuoClickApplicationContext context = null;
+            try
+            {
+                context = new DuoClickApplicationContext(false, false, path);
+                Assert(!File.Exists(path),
+                    "constructing an invisible test context should not write user settings");
+
+                context.SetPausedForTesting(true);
+                context.ShowCopiedFeedbackForTesting();
+                AssertEqual(AppLocalization.Get(context.LanguageForTesting,
+                    AppText.TooltipCopied), context.TrayTooltipForTesting,
+                    "copy feedback should replace paused tooltip temporarily");
+                context.ClearTooltipFeedbackForTesting();
+                AssertEqual(AppLocalization.Get(context.LanguageForTesting,
+                    AppText.TooltipPaused), context.TrayTooltipForTesting,
+                    "clearing copy feedback should restore paused tooltip");
+
+                context.ChangeLanguageForTesting(AppLanguage.SimplifiedChinese);
+                AssertEqual(AppLanguage.SimplifiedChinese, context.LanguageForTesting,
+                    "language should change immediately");
+                AssertEqual("zh-CN", File.ReadAllText(path),
+                    "language switch should persist in the selected settings path");
+                AssertEqual(AppLocalization.Get(AppLanguage.SimplifiedChinese,
+                    AppText.TooltipPaused), context.TrayTooltipForTesting,
+                    "language change should immediately localize current paused status");
+            }
+            finally
+            {
+                if (context != null)
+                    context.Dispose();
+                if (Directory.Exists(directory))
+                    Directory.Delete(directory, true);
+            }
         }
 
         private static void Run(string name, Action test)

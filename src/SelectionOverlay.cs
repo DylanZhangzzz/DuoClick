@@ -8,13 +8,16 @@ namespace DuoClick
     {
         private readonly Bitmap _image;
         private readonly Rectangle _desktopBounds;
+        private AppLanguage _language;
         private Point _start;
         private Point _current;
 
-        internal SelectionOverlay(Bitmap image, Rectangle desktopBounds, Point start)
+        internal SelectionOverlay(Bitmap image, Rectangle desktopBounds, Point start,
+            AppLanguage language)
         {
             _image = image;
             _desktopBounds = desktopBounds;
+            _language = language;
             _start = start;
             _current = start;
 
@@ -32,6 +35,12 @@ namespace DuoClick
         internal void SetSelectionEnd(Point point)
         {
             _current = point;
+            Invalidate();
+        }
+
+        internal void SetLanguage(AppLanguage language)
+        {
+            _language = language;
             Invalidate();
         }
 
@@ -81,7 +90,7 @@ namespace DuoClick
                 }
             }
 
-            DrawInstruction(graphics);
+            DrawInstruction(graphics, _language);
         }
 
         private Rectangle GetLocalSelection()
@@ -95,9 +104,9 @@ namespace DuoClick
             return Rectangle.Intersect(selection, ClientRectangle);
         }
 
-        private static void DrawInstruction(Graphics graphics)
+        private static void DrawInstruction(Graphics graphics, AppLanguage language)
         {
-            const string instruction = "拖动选择区域 · 松开左右键完成 · Esc 取消";
+            string instruction = AppLocalization.Get(language, AppText.OverlayInstruction);
             using (Font font = new Font("Segoe UI", 12.0f, FontStyle.Regular, GraphicsUnit.Point))
             {
                 SizeF size = graphics.MeasureString(instruction, font);
