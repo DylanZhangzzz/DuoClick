@@ -15,18 +15,28 @@ namespace DuoClick.Tests
     {
         private static int _passed;
         private static int _failed;
+        private const int CompositeMinimumWidth = 96;
+        private const int CompositeHeaderHeight = 32;
+        private const int CompositeImageGap = 8;
 
         [STAThread]
         public static int Main(string[] args)
         {
-            if (args.Length > 1 || (args.Length == 1 && args[0] != "--integration"))
+            if (args.Length > 1 || (args.Length == 1 && args[0] != "--integration" &&
+                args[0] != "--previews"))
             {
-                Console.WriteLine("Usage: DuoClick.Tests.exe [--integration]");
+                Console.WriteLine("Usage: DuoClick.Tests.exe [--integration | --previews]");
                 return 2;
             }
 
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
+
+            if (args.Length == 1 && args[0] == "--previews")
+            {
+                WritePreviewArtifacts();
+                return 0;
+            }
 
             Run("left then right, left then right release", LeftThenRightLeftThenRightRelease);
             Run("left then right, right then left release", LeftThenRightRightThenLeftRelease);
@@ -43,15 +53,19 @@ namespace DuoClick.Tests
             Run("selection geometry supports negative origins and reverse direction", GeometrySupportsNegativeOriginsAndReverseDirection);
             Run("selection geometry clips to desktop bounds", GeometryClipsToDesktopBounds);
             Run("selection minimum size is two pixels per side", GeometryEnforcesMinimumSize);
+            Run("composite chrome keeps its minimum width and numbered headers", CompositeChromeMetricsAreStable);
             CaptureBatchTests.Run(Run);
             Run("localization catalog is complete and tray text fits Windows limits", LocalizationCatalogIsComplete);
             Run("language settings choose system default and persist selections", LanguageSettingsPersistSelections);
+            Run("capture limit settings handle missing, invalid, and persisted values", CaptureLimitSettingsPersistValues);
             Run("tray feedback restores ready or paused status", TrayFeedbackRestoresBaseStatus);
             Run("language switch persists and restores localized paused status", LanguageSwitchPersistsAndRestoresTooltip);
             Run("embedded tray icon resource is a valid ICO", EmbeddedTrayIconIsValid);
 
             if (args.Length == 1)
             {
+                Run("application capacity persists and evicts oldest captures first", ApplicationCapacityPersistsAndEvictsOldest);
+                Run("lowering capacity keeps foreign clipboard content", LoweringCapacityPreservesForeignClipboard);
                 Run("live desktop capture returns a disposable bitmap", LiveDesktopCaptureSmoke);
                 Run("synthetic selection copies the expected crop and disposes overlay", SyntheticClipboardIntegrationSmoke);
                 Run("three synthetic crops stitch in selection order", ThreeSyntheticCropsStitchInSelectionOrder);
@@ -92,6 +106,16 @@ namespace DuoClick.Tests
             }
         }
 
+        private static void CompositeChromeMetricsAreStable()
+        {
+            AssertEqual(CompositeMinimumWidth, CaptureBatch.MinimumCompositeWidth,
+                "composite minimum width");
+            AssertEqual(CompositeHeaderHeight, CaptureBatch.CompositeHeaderHeight,
+                "numbered header height");
+            AssertEqual(CompositeImageGap, CaptureBatch.CompositeImageGap,
+                "inter-image gap");
+        }
+
         private static void LanguageSettingsPersistSelections()
         {
             string directory = Path.Combine(Path.GetTempPath(), "DuoClickTests",
@@ -120,6 +144,215 @@ namespace DuoClick.Tests
             }
             finally
             {
+                if (Directory.Exists(directory))
+                    Directory.Delete(directory, true);
+            }
+        }
+
+        private static void CaptureLimitSettingsPersistValues()
+        {
+            string directory = Path.Combine(Path.GetTempPath(), "DuoClickTests",
+                Guid.NewGuid().ToString("N"));
+            string path = Path.Combine(directory, "capture-limit.txt");
+            try
+            {
+                CaptureLimitLoadResult missing = CaptureLimitSettings.Load(path);
+                AssertEqual(CaptureLimitSettings.DefaultCapacity, missing.Capacity,
+                    "missing capture-limit file should use the default");
+                Assert(missing.Error == null, "missing capture-limit file is expected on first run");
+
+                Exception error;
+                Assert(!CaptureLimitSettings.TrySave(path,
+                    CaptureLimitSettings.MaximumCapacity + 1, out error),
+                    "a value above the supported maximum should not be saved");
+                Assert(error != null, "invalid capacity save should report its error");
+
+                Assert(CaptureLimitSettings.TrySave(path,
+                    CaptureLimitSettings.MaximumCapacity, out error),
+                    "maximum capture limit should save: " +
+                        (error == null ? String.Empty : error.Message));
+                CaptureLimitLoadResult saved = CaptureLimitSettings.Load(path);
+                AssertEqual(CaptureLimitSettings.MaximumCapacity, saved.Capacity,
+                    "saved maximum capture limit should load");
+                Assert(saved.Error == null, "valid capture-limit file should not report an error");
+
+                File.WriteAllText(path, "101");
+                CaptureLimitLoadResult invalid = CaptureLimitSettings.Load(path);
+                AssertEqual(CaptureLimitSettings.DefaultCapacity, invalid.Capacity,
+                    "out-of-range saved value should fall back to default");
+                Assert(invalid.Error != null,
+                    "out-of-range saved value should be reported as invalid");
+
+                string languagePath = Path.Combine(directory, "language.txt");
+                string applicationPath =
+                    CaptureLimitSettings.GetPathForLanguageSettingsPath(languagePath);
+                File.WriteAllText(applicationPath, "101");
+                using (DuoClickApplicationContext context =
+                    new DuoClickApplicationContext(false, false, languagePath))
+                {
+                    AssertEqual(CaptureLimitSettings.DefaultCapacity,
+                        context.CaptureLimitForTesting,
+                        "application should use default capacity for an invalid saved value");
+                }
+            }
+            finally
+            {
+                if (Directory.Exists(directory))
+                    Directory.Delete(directory, true);
+            }
+        }
+
+        private static void ApplicationCapacityPersistsAndEvictsOldest()
+        {
+            string directory = Path.Combine(Path.GetTempPath(), "DuoClickTests",
+                Guid.NewGuid().ToString("N"));
+            string languagePath = Path.Combine(directory, "language.txt");
+            DuoClickApplicationContext context = null;
+            DuoClickApplicationContext reloadedContext = null;
+            List<IDisposable> clipboardSnapshotValues = null;
+            IDataObject originalClipboard = null;
+            Bitmap copied = null;
+            try
+            {
+                originalClipboard = CaptureClipboardSnapshot(out clipboardSnapshotValues);
+                DataObject sentinel = new DataObject();
+                sentinel.SetData("DuoClick.TestSentinel", false, Guid.NewGuid().ToString("N"));
+                SetClipboardForTesting(sentinel);
+
+                context = new DuoClickApplicationContext(false, false, languagePath);
+                AssertEqual(CaptureLimitSettings.DefaultCapacity,
+                    context.CaptureLimitForTesting, "first-run application capacity");
+                Assert(CaptureLimitSettings.MaximumCapacity == 100,
+                    "the supported maximum should remain the documented 100 captures");
+                Assert(context.ApplyCaptureLimitForTesting(CaptureLimitSettings.MaximumCapacity),
+                    "application should apply and persist its maximum capture limit");
+                context.ExitThread();
+                context.Dispose();
+                context = null;
+
+                context = new DuoClickApplicationContext(false, false, languagePath);
+                AssertEqual(CaptureLimitSettings.MaximumCapacity, context.CaptureLimitForTesting,
+                    "maximum capture limit should persist across application contexts");
+                Assert(context.ApplyCaptureLimitForTesting(3),
+                    "application should apply and persist a three-capture limit");
+
+                context.PublishCropForTesting(1, CreateSolidBitmap(1, 1, Color.Red));
+                context.PublishCropForTesting(2, CreateSolidBitmap(1, 1, Color.Green));
+                context.PublishCropForTesting(3, CreateSolidBitmap(1, 1, Color.Blue));
+                context.PublishCropForTesting(4, CreateSolidBitmap(1, 1, Color.Yellow));
+                WaitForClipboardQueueToDrain(context, TimeSpan.FromSeconds(10));
+
+                copied = WaitForExpectedClipboardBitmap(CompositeMinimumWidth,
+                    CompositeHeight(1, 1, 1), TimeSpan.FromSeconds(10));
+                Assert(copied != null,
+                    "three retained captures should publish a numbered composite");
+                AssertEqual(3, context.BatchCountForTesting,
+                    "configured capacity should bound the application batch");
+                AssertSolidImageRegion(copied, CompositeContentTop(), 1, 1, Color.Green,
+                    "oldest retained capture after FIFO eviction");
+                AssertSolidImageRegion(copied, CompositeContentTop(1), 1, 1, Color.Blue,
+                    "middle retained capture after FIFO eviction");
+                AssertSolidImageRegion(copied, CompositeContentTop(1, 1), 1, 1, Color.Yellow,
+                    "newest retained capture after FIFO eviction");
+
+                context.ExitThread();
+                context.Dispose();
+                context = null;
+                reloadedContext = new DuoClickApplicationContext(false, false, languagePath);
+                AssertEqual(3, reloadedContext.CaptureLimitForTesting,
+                    "application changes to the capture limit should persist");
+            }
+            finally
+            {
+                if (copied != null)
+                    copied.Dispose();
+                if (context != null)
+                {
+                    context.ExitThread();
+                    context.Dispose();
+                }
+                if (reloadedContext != null)
+                {
+                    reloadedContext.ExitThread();
+                    reloadedContext.Dispose();
+                }
+
+                if (originalClipboard != null)
+                {
+                    try { RestoreClipboard(originalClipboard); }
+                    finally { DisposeAll(clipboardSnapshotValues); }
+                }
+                else if (clipboardSnapshotValues != null)
+                    DisposeAll(clipboardSnapshotValues);
+
+                if (Directory.Exists(directory))
+                    Directory.Delete(directory, true);
+            }
+        }
+
+        private static void LoweringCapacityPreservesForeignClipboard()
+        {
+            List<IDisposable> clipboardSnapshotValues;
+            IDataObject originalClipboard = CaptureClipboardSnapshot(out clipboardSnapshotValues);
+            string directory = Path.Combine(Path.GetTempPath(), "DuoClickTests",
+                Guid.NewGuid().ToString("N"));
+            string languagePath = Path.Combine(directory, "language.txt");
+            DuoClickApplicationContext context = null;
+            Bitmap foreignImage = null;
+            Bitmap observedImage = null;
+            try
+            {
+                context = new DuoClickApplicationContext(false, false, languagePath);
+                context.PublishCropForTesting(1, CreateSolidBitmap(2, 1, Color.Red));
+                context.PublishCropForTesting(2, CreateSolidBitmap(2, 1, Color.Green));
+                context.PublishCropForTesting(3, CreateSolidBitmap(2, 1, Color.Blue));
+                WaitForClipboardQueueToDrain(context, TimeSpan.FromSeconds(10));
+
+                const string markerFormat = "DuoClick.ForeignClipboardMarker";
+                const string markerValue = "keep this external content";
+                foreignImage = CreateSolidBitmap(3, 2, Color.Orange);
+                DataObject unrelated = new DataObject();
+                unrelated.SetData(markerFormat, false, markerValue);
+                unrelated.SetData(DataFormats.Bitmap, foreignImage);
+                SetClipboardForTesting(unrelated);
+
+                Assert(context.ApplyCaptureLimitForTesting(2),
+                    "lowering the capacity should succeed");
+                WaitForClipboardQueueToDrain(context, TimeSpan.FromSeconds(10));
+                AssertEqual(2, context.BatchCountForTesting,
+                    "lowering capacity should retain only the newest two captures");
+
+                IDataObject current = Clipboard.GetDataObject();
+                Assert(current != null && current.GetDataPresent(markerFormat),
+                    "capacity change should preserve a foreign clipboard marker");
+                AssertEqual(markerValue, (string)current.GetData(markerFormat, false),
+                    "foreign clipboard marker value should remain intact");
+                string[] formats = current.GetFormats(false);
+                observedImage = current.GetData(DataFormats.Bitmap, false) as Bitmap;
+                Assert(observedImage != null,
+                    "capacity change should preserve the foreign clipboard bitmap; formats: " +
+                    String.Join(", ", formats));
+                AssertEqual(Color.Orange.ToArgb(), observedImage.GetPixel(2, 1).ToArgb(),
+                    "foreign bitmap pixels should remain intact");
+            }
+            finally
+            {
+                if (observedImage != null)
+                    observedImage.Dispose();
+                if (context != null)
+                {
+                    context.ExitThread();
+                    context.Dispose();
+                }
+
+                try { RestoreClipboard(originalClipboard); }
+                finally
+                {
+                    if (foreignImage != null)
+                        foreignImage.Dispose();
+                    DisposeAll(clipboardSnapshotValues);
+                }
+
                 if (Directory.Exists(directory))
                     Directory.Delete(directory, true);
             }
@@ -496,7 +729,7 @@ namespace DuoClick.Tests
                 sentinel.SetData("DuoClick.TestSentinel", false, Guid.NewGuid().ToString("N"));
                 SetClipboardForTesting(sentinel);
 
-                context = new DuoClickApplicationContext(false, false);
+                context = new DuoClickApplicationContext(false, false, CreateTemporaryLanguageSettingsPath());
 
                 Rectangle bounds = new Rectangle(-100, -50, 12, 10);
                 using (Bitmap source = CreatePatternBitmap(bounds.Size))
@@ -511,17 +744,12 @@ namespace DuoClick.Tests
                         "selection overlay should be disposed after completion");
                 }
 
-                copied = WaitForExpectedClipboardBitmap(6, 6, TimeSpan.FromSeconds(10));
-                Assert(copied != null, "cropped bitmap should reach the clipboard");
-                for (int y = 0; y < copied.Height; y++)
-                {
-                    for (int x = 0; x < copied.Width; x++)
-                    {
-                        Color expected = PatternColor(x + 4, y + 3);
-                        AssertEqual(expected.ToArgb(), copied.GetPixel(x, y).ToArgb(),
-                            "cropped pixel " + x + "," + y);
-                    }
-                }
+                copied = WaitForExpectedClipboardBitmap(CompositeMinimumWidth,
+                    CompositeHeight(6), TimeSpan.FromSeconds(10));
+                Assert(copied != null,
+                    "one crop should reach the clipboard with numbered composite chrome");
+                AssertPatternImageRegion(copied, CompositeHeaderHeight, 4, 3, 6, 6,
+                    "cropped image pixel");
             }
             finally
             {
@@ -550,26 +778,29 @@ namespace DuoClick.Tests
                 sentinel.SetData("DuoClick.TestSentinel", false, Guid.NewGuid().ToString("N"));
                 SetClipboardForTesting(sentinel);
 
-                context = new DuoClickApplicationContext(false, false);
+                context = new DuoClickApplicationContext(false, false, CreateTemporaryLanguageSettingsPath());
                 context.PublishCropForTesting(1, CreateSolidBitmap(4, 2, Color.Red));
                 context.PublishCropForTesting(2, CreateSolidBitmap(2, 3, Color.Green));
                 context.PublishCropForTesting(3, CreateSolidBitmap(3, 1, Color.Blue));
 
-                copied = WaitForExpectedClipboardBitmap(4, 6, TimeSpan.FromSeconds(10));
-                Assert(copied != null, "three accepted crops should create a 4 by 6 clipboard bitmap");
+                copied = WaitForExpectedClipboardBitmap(CompositeMinimumWidth,
+                    CompositeHeight(2, 3, 1), TimeSpan.FromSeconds(10));
+                Assert(copied != null,
+                    "three accepted crops should create a numbered composite clipboard bitmap");
                 AssertEqual(3, context.BatchCountForTesting, "batch should retain all three captures");
-
-                for (int y = 0; y < copied.Height; y++)
-                {
-                    Color expected = y < 2 ? Color.Red : (y < 5 ? Color.Green : Color.Blue);
-                    for (int x = 0; x < copied.Width; x++)
-                    {
-                        Color expectedPixel = x < (y < 2 ? 4 : (y < 5 ? 2 : 3))
-                            ? expected : Color.White;
-                        AssertEqual(expectedPixel.ToArgb(), copied.GetPixel(x, y).ToArgb(),
-                            "stitched pixel " + x + "," + y);
-                    }
-                }
+                int secondHeaderTop = CompositeContentTop(2) - CompositeHeaderHeight;
+                int thirdHeaderTop = CompositeContentTop(2, 3) - CompositeHeaderHeight;
+                AssertNumberedHeader(copied, 0, "first composite header");
+                AssertNumberedHeader(copied, secondHeaderTop, "second composite header");
+                AssertNumberedHeader(copied, thirdHeaderTop, "third composite header");
+                AssertHeaderRegionsDiffer(copied, 0, secondHeaderTop,
+                    "the capture number should change between headers");
+                AssertSolidImageRegion(copied, CompositeContentTop(), 4, 2, Color.Red,
+                    "first stitched crop");
+                AssertSolidImageRegion(copied, CompositeContentTop(2), 2, 3, Color.Green,
+                    "second stitched crop");
+                AssertSolidImageRegion(copied, CompositeContentTop(2, 3), 3, 1, Color.Blue,
+                    "third stitched crop");
             }
             finally
             {
@@ -600,9 +831,10 @@ namespace DuoClick.Tests
                 sentinel.SetData("DuoClick.TestSentinel", false, Guid.NewGuid().ToString("N"));
                 SetClipboardForTesting(sentinel);
 
-                context = new DuoClickApplicationContext(false, false);
+                context = new DuoClickApplicationContext(false, false, CreateTemporaryLanguageSettingsPath());
                 context.PublishCropForTesting(1, CreateSolidBitmap(4, 2, Color.Red));
-                published = WaitForExpectedClipboardBitmap(4, 2, TimeSpan.FromSeconds(10));
+                published = WaitForExpectedClipboardBitmap(CompositeMinimumWidth,
+                    CompositeHeight(2), TimeSpan.FromSeconds(10));
                 Assert(published != null, "first capture should be published before reset");
                 AssertEqual(1, context.BatchCountForTesting, "first capture should be in the group");
 
@@ -611,18 +843,19 @@ namespace DuoClick.Tests
                 AssertEqual(0, context.BatchCountForTesting,
                     "paste shortcut against the current published bitmap should reset the group");
 
-                preserved = WaitForExpectedClipboardBitmap(4, 2, TimeSpan.FromSeconds(1));
+                preserved = WaitForExpectedClipboardBitmap(CompositeMinimumWidth,
+                    CompositeHeight(2), TimeSpan.FromSeconds(1));
                 Assert(preserved != null, "reset should leave the published clipboard bitmap intact");
                 AssertBitmapsEqual(published, preserved, "clipboard pixels should survive reset");
 
                 context.PublishCropForTesting(2, CreateSolidBitmap(5, 1, Color.Blue));
-                nextBatch = WaitForExpectedClipboardBitmap(5, 1, TimeSpan.FromSeconds(10));
+                nextBatch = WaitForExpectedClipboardBitmap(CompositeMinimumWidth,
+                    CompositeHeight(1), TimeSpan.FromSeconds(10));
                 Assert(nextBatch != null, "next capture should publish as a one-capture group");
                 AssertEqual(1, context.BatchCountForTesting,
                     "next group should contain only the capture made after reset");
-                for (int x = 0; x < nextBatch.Width; x++)
-                    AssertEqual(Color.Blue.ToArgb(), nextBatch.GetPixel(x, 0).ToArgb(),
-                        "next-group pixel " + x);
+                AssertSolidImageRegion(nextBatch, CompositeHeaderHeight, 5, 1, Color.Blue,
+                    "next-group crop");
             }
             finally
             {
@@ -655,9 +888,10 @@ namespace DuoClick.Tests
                 sentinel.SetData("DuoClick.TestSentinel", false, Guid.NewGuid().ToString("N"));
                 SetClipboardForTesting(sentinel);
 
-                context = new DuoClickApplicationContext(false, false);
+                context = new DuoClickApplicationContext(false, false, CreateTemporaryLanguageSettingsPath());
                 context.PublishCropForTesting(1, CreateSolidBitmap(4, 2, Color.Red));
-                published = WaitForExpectedClipboardBitmap(4, 2, TimeSpan.FromSeconds(10));
+                published = WaitForExpectedClipboardBitmap(CompositeMinimumWidth,
+                    CompositeHeight(2), TimeSpan.FromSeconds(10));
                 Assert(published != null, "capture should be published before foreign clipboard update");
                 uint publishedSequence = context.ClipboardSequenceForTesting;
 
@@ -707,7 +941,7 @@ namespace DuoClick.Tests
                 sentinel.SetData("DuoClick.TestSentinel", false, Guid.NewGuid().ToString("N"));
                 SetClipboardForTesting(sentinel);
 
-                context = new DuoClickApplicationContext(false, false);
+                context = new DuoClickApplicationContext(false, false, CreateTemporaryLanguageSettingsPath());
                 stage = "capture reservation";
                 Assert(context.ReserveCaptureForTesting(1, new Size(4, 2)),
                     "capture should reserve its place before crop completion");
@@ -786,7 +1020,7 @@ namespace DuoClick.Tests
                 sentinel.SetData("DuoClick.TestSentinel", false, Guid.NewGuid().ToString("N"));
                 SetClipboardForTesting(sentinel);
 
-                context = new DuoClickApplicationContext(false, false);
+                context = new DuoClickApplicationContext(false, false, CreateTemporaryLanguageSettingsPath());
                 context.PublishCropForTesting(1, CreateSolidBitmap(4, 2, Color.Red));
 
                 Rectangle bounds = new Rectangle(-100, -50, 12, 10);
@@ -796,7 +1030,8 @@ namespace DuoClick.Tests
 
                 // The next selection records the current clipboard sequence before
                 // the first composition is allowed to publish.
-                firstPublished = WaitForExpectedClipboardBitmap(4, 2, TimeSpan.FromSeconds(10));
+                firstPublished = WaitForExpectedClipboardBitmap(CompositeMinimumWidth,
+                    CompositeHeight(2), TimeSpan.FromSeconds(10));
                 Assert(firstPublished != null,
                     "first composition should publish while next capture is active");
 
@@ -804,22 +1039,16 @@ namespace DuoClick.Tests
                 using (Bitmap source = CreateSolidBitmap(bounds.Width, bounds.Height, Color.Green))
                     context.CompleteCaptureForTesting(nextSession, bounds, source);
 
-                combined = WaitForExpectedClipboardBitmap(4, 5, TimeSpan.FromSeconds(10));
+                combined = WaitForExpectedClipboardBitmap(CompositeMinimumWidth,
+                    CompositeHeight(2, 3), TimeSpan.FromSeconds(10));
                 Assert(combined != null,
                     "the active selection should publish after the app's own earlier clipboard write");
                 AssertEqual(2, context.BatchCountForTesting,
                     "both the first capture and active selection should remain grouped");
-                for (int y = 0; y < combined.Height; y++)
-                {
-                    for (int x = 0; x < combined.Width; x++)
-                    {
-                        Color expected = y < 2
-                            ? Color.Red
-                            : (x < 3 ? Color.Green : Color.White);
-                        AssertEqual(expected.ToArgb(), combined.GetPixel(x, y).ToArgb(),
-                            "rebased composite pixel " + x + "," + y);
-                    }
-                }
+                AssertSolidImageRegion(combined, CompositeContentTop(), 4, 2, Color.Red,
+                    "first rebased crop");
+                AssertSolidImageRegion(combined, CompositeContentTop(2), 3, 3, Color.Green,
+                    "second rebased crop");
             }
             finally
             {
@@ -851,7 +1080,7 @@ namespace DuoClick.Tests
                 sentinel.SetData(markerFormat, false, markerValue);
                 SetClipboardForTesting(sentinel);
 
-                context = new DuoClickApplicationContext(false, false);
+                context = new DuoClickApplicationContext(false, false, CreateTemporaryLanguageSettingsPath());
                 Rectangle bounds = new Rectangle(-100, -50, 12, 10);
                 Point start = new Point(-96, -47);
                 using (Bitmap source = CreatePatternBitmap(bounds.Size))
@@ -910,7 +1139,7 @@ namespace DuoClick.Tests
                 sentinel.SetData("DuoClick.TestSentinel", false, Guid.NewGuid().ToString("N"));
                 SetClipboardForTesting(sentinel);
 
-                context = new DuoClickApplicationContext(false, false);
+                context = new DuoClickApplicationContext(false, false, CreateTemporaryLanguageSettingsPath());
                 Rectangle bounds = new Rectangle(-100, -50, 12, 10);
                 Point start = new Point(-96, -47);
                 Point end = new Point(-90, -41);
@@ -922,20 +1151,15 @@ namespace DuoClick.Tests
                 using (Bitmap source = CreatePatternBitmap(bounds.Size))
                     context.CompleteCaptureForTesting(sessionId, source);
 
-                copied = WaitForExpectedClipboardBitmap(6, 6, TimeSpan.FromSeconds(10));
-                Assert(copied != null, "queued finish point should produce a 6 by 6 clipboard crop");
+                copied = WaitForExpectedClipboardBitmap(CompositeMinimumWidth,
+                    CompositeHeight(6), TimeSpan.FromSeconds(10));
+                Assert(copied != null,
+                    "queued finish point should produce a numbered 6 by 6 clipboard crop");
                 Assert(!context.HasSelectionOverlayForTesting,
                     "overlay should be disposed after early completion is drained");
 
-                for (int y = 0; y < copied.Height; y++)
-                {
-                    for (int x = 0; x < copied.Width; x++)
-                    {
-                        Color expected = PatternColor(x + 4, y + 3);
-                        AssertEqual(expected.ToArgb(), copied.GetPixel(x, y).ToArgb(),
-                            "early-finish cropped pixel " + x + "," + y);
-                    }
-                }
+                AssertPatternImageRegion(copied, CompositeHeaderHeight, 4, 3, 6, 6,
+                    "early-finish cropped image pixel");
             }
             finally
             {
@@ -964,16 +1188,17 @@ namespace DuoClick.Tests
                 sentinel.SetData("DuoClick.TestSentinel", false, Guid.NewGuid().ToString("N"));
                 SetClipboardForTesting(sentinel);
 
-                context = new DuoClickApplicationContext(false, false);
+                context = new DuoClickApplicationContext(false, false, CreateTemporaryLanguageSettingsPath());
 
                 context.PublishCropForTesting(200, CreateSolidBitmap(7, 5, Color.Blue));
                 context.PublishCropForTesting(199, CreateSolidBitmap(2, 2, Color.Red));
 
-                copied = WaitForExpectedClipboardBitmap(7, 5, TimeSpan.FromSeconds(10));
+                copied = WaitForExpectedClipboardBitmap(CompositeMinimumWidth,
+                    CompositeHeight(5), TimeSpan.FromSeconds(10));
                 Assert(copied != null, "newer session crop should reach the clipboard");
-                AssertEqual(Color.Blue.ToArgb(), copied.GetPixel(0, 0).ToArgb(),
+                AssertEqual(Color.Blue.ToArgb(), copied.GetPixel(0, CompositeHeaderHeight).ToArgb(),
                     "clipboard should retain the newer session image");
-                AssertEqual(Color.Blue.ToArgb(), copied.GetPixel(6, 4).ToArgb(),
+                AssertEqual(Color.Blue.ToArgb(), copied.GetPixel(6, CompositeHeaderHeight + 4).ToArgb(),
                     "older crop should not replace the newer image");
             }
             finally
@@ -1003,7 +1228,7 @@ namespace DuoClick.Tests
                 sentinel.SetData("DuoClick.TestSentinel", false, Guid.NewGuid().ToString("N"));
                 SetClipboardForTesting(sentinel);
 
-                context = new DuoClickApplicationContext(false, false);
+                context = new DuoClickApplicationContext(false, false, CreateTemporaryLanguageSettingsPath());
                 Rectangle firstBounds = new Rectangle(-100, -50, 12, 10);
                 Rectangle nextBounds = new Rectangle(-200, -80, 10, 8);
                 Point firstStart = new Point(-96, -47);
@@ -1027,21 +1252,16 @@ namespace DuoClick.Tests
 
                 Assert(!context.HasSelectionOverlayForTesting,
                     "both completed selections should release their overlays");
-                copied = WaitForExpectedClipboardBitmap(6, 9, TimeSpan.FromSeconds(10));
-                Assert(copied != null, "queued captures should produce a vertically stitched bitmap");
+                copied = WaitForExpectedClipboardBitmap(CompositeMinimumWidth,
+                    CompositeHeight(6, 3), TimeSpan.FromSeconds(10));
+                Assert(copied != null,
+                    "queued captures should produce a numbered vertically stitched bitmap");
                 AssertEqual(2, context.BatchCountForTesting,
                     "both queued selections should remain in the batch");
-                for (int y = 0; y < copied.Height; y++)
-                {
-                    for (int x = 0; x < copied.Width; x++)
-                    {
-                        Color expected = y < 6
-                            ? PatternColor(x + 4, y + 3)
-                            : (x < 4 ? Color.Green : Color.White);
-                        AssertEqual(expected.ToArgb(), copied.GetPixel(x, y).ToArgb(),
-                            "queued composite pixel " + x + "," + y);
-                    }
-                }
+                AssertPatternImageRegion(copied, CompositeContentTop(), 4, 3, 6, 6,
+                    "first queued crop pixel");
+                AssertSolidImageRegion(copied, CompositeContentTop(6), 4, 3, Color.Green,
+                    "second queued crop");
             }
             finally
             {
@@ -1094,6 +1314,117 @@ namespace DuoClick.Tests
             return null;
         }
 
+        private static string CreateTemporaryLanguageSettingsPath()
+        {
+            return Path.Combine(Path.GetTempPath(), "DuoClickTests",
+                Guid.NewGuid().ToString("N"), "language.txt");
+        }
+
+        private static void WaitForClipboardQueueToDrain(DuoClickApplicationContext context,
+            TimeSpan timeout)
+        {
+            DateTime deadline = DateTime.UtcNow + timeout;
+            while (context.HasPendingClipboardCopyForTesting && DateTime.UtcNow < deadline)
+            {
+                Application.DoEvents();
+                Thread.Sleep(10);
+            }
+            Application.DoEvents();
+            Assert(!context.HasPendingClipboardCopyForTesting,
+                "composite and clipboard work should finish within the timeout");
+        }
+
+        private static int CompositeHeight(params int[] imageHeights)
+        {
+            if (imageHeights == null || imageHeights.Length == 0)
+                throw new ArgumentException("At least one capture height is required.", "imageHeights");
+
+            int height = imageHeights.Length * CompositeHeaderHeight +
+                (imageHeights.Length - 1) * CompositeImageGap;
+            for (int i = 0; i < imageHeights.Length; i++)
+                height += imageHeights[i];
+            return height;
+        }
+
+        private static int CompositeContentTop(params int[] precedingImageHeights)
+        {
+            int top = CompositeHeaderHeight;
+            if (precedingImageHeights == null)
+                return top;
+
+            for (int i = 0; i < precedingImageHeights.Length; i++)
+                top += precedingImageHeights[i] + CompositeImageGap + CompositeHeaderHeight;
+            return top;
+        }
+
+        private static void AssertPatternImageRegion(Bitmap composite, int contentTop,
+            int sourceX, int sourceY, int width, int height, string message)
+        {
+            AssertImageRegion(composite, contentTop, width, height,
+                delegate(int x, int y) { return PatternColor(sourceX + x, sourceY + y); },
+                message);
+        }
+
+        private static void AssertSolidImageRegion(Bitmap composite, int contentTop,
+            int width, int height, Color color, string message)
+        {
+            AssertImageRegion(composite, contentTop, width, height,
+                delegate { return color; }, message);
+        }
+
+        private static void AssertImageRegion(Bitmap composite, int contentTop,
+            int width, int height, Func<int, int, Color> expectedPixel, string message)
+        {
+            Assert(composite != null, message + " composite should exist");
+            Assert(contentTop >= 0 && contentTop + height <= composite.Height,
+                message + " should fit within composite height");
+            Assert(width <= composite.Width,
+                message + " should fit within composite width");
+            for (int y = 0; y < height; y++)
+            {
+                for (int x = 0; x < width; x++)
+                    AssertEqual(expectedPixel(x, y).ToArgb(),
+                        composite.GetPixel(x, contentTop + y).ToArgb(),
+                        message + " pixel " + x + "," + y);
+            }
+        }
+
+        private static void AssertNumberedHeader(Bitmap composite, int headerTop, string message)
+        {
+            AssertEqual(Color.FromArgb(240, 240, 240).ToArgb(),
+                composite.GetPixel(0, headerTop).ToArgb(), message + " background");
+            int darkTextPixels = 0;
+            for (int y = headerTop; y < headerTop + CompositeHeaderHeight - 1; y++)
+            {
+                for (int x = 8; x < composite.Width; x++)
+                {
+                    Color pixel = composite.GetPixel(x, y);
+                    if (pixel.R < 160 && pixel.G < 160 && pixel.B < 160)
+                        darkTextPixels++;
+                }
+            }
+            Assert(darkTextPixels > 0, message + " should contain its capture label");
+        }
+
+        private static void AssertHeaderRegionsDiffer(Bitmap composite, int firstHeaderTop,
+            int secondHeaderTop, string message)
+        {
+            bool differs = false;
+            for (int y = 0; y < CompositeHeaderHeight - 1 && !differs; y++)
+            {
+                for (int x = 8; x < composite.Width; x++)
+                {
+                    if (composite.GetPixel(x, firstHeaderTop + y).ToArgb() !=
+                        composite.GetPixel(x, secondHeaderTop + y).ToArgb())
+                    {
+                        differs = true;
+                        break;
+                    }
+                }
+            }
+            Assert(differs, message);
+        }
+
         private static Bitmap CreatePatternBitmap(Size size)
         {
             Bitmap image = new Bitmap(size.Width, size.Height);
@@ -1114,6 +1445,96 @@ namespace DuoClick.Tests
                     image.SetPixel(x, y, color);
             }
             return image;
+        }
+
+        private static void WritePreviewArtifacts()
+        {
+            DirectoryInfo projectRoot = new DirectoryInfo(AppDomain.CurrentDomain.BaseDirectory);
+            while (projectRoot != null &&
+                !File.Exists(Path.Combine(projectRoot.FullName, "build.ps1")))
+                projectRoot = projectRoot.Parent;
+            if (projectRoot == null)
+                throw new DirectoryNotFoundException(
+                    "Could not locate build.ps1 to find the project output directory.");
+
+            string outputDirectory = Path.Combine(projectRoot.FullName,
+                "dist", "v0.3.0");
+            Directory.CreateDirectory(outputDirectory);
+
+            using (CaptureBatch batch = new CaptureBatch(3))
+            {
+                Color[] colors = new Color[]
+                {
+                    Color.FromArgb(245, 139, 130),
+                    Color.FromArgb(137, 201, 154),
+                    Color.FromArgb(132, 175, 232)
+                };
+                string[] labels = new string[] { "Warm panel", "Growth panel", "Cool panel" };
+                for (int i = 0; i < colors.Length; i++)
+                {
+                    long sessionId = i + 1;
+                    using (Bitmap panel = CreateSolidBitmap(360, 88, colors[i]))
+                    using (Graphics graphics = Graphics.FromImage(panel))
+                    using (Font font = new Font(FontFamily.GenericSansSerif, 19.0f,
+                        FontStyle.Bold, GraphicsUnit.Pixel))
+                    using (SolidBrush brush = new SolidBrush(Color.FromArgb(40, 48, 58)))
+                    {
+                        graphics.DrawString(labels[i], font, brush, 22, 25);
+                        Assert(batch.Reserve(sessionId, panel.Size),
+                            "preview panel should reserve in the compositor");
+                        AssertEqual(CaptureBatchCompletionResult.Accepted,
+                            batch.Complete(sessionId, (Bitmap)panel.Clone()),
+                            "preview panel should enter the compositor");
+                    }
+                }
+
+                using (CaptureBatchSnapshot snapshot = batch.CreateSnapshot())
+                using (Bitmap composite = CaptureBatch.Compose(snapshot))
+                    composite.Save(Path.Combine(outputDirectory, "composite-demo.png"),
+                        System.Drawing.Imaging.ImageFormat.Png);
+            }
+
+            WriteSettingsDialogPreview(AppLanguage.English,
+                Path.Combine(outputDirectory, "settings-en.png"));
+            WriteSettingsDialogPreview(AppLanguage.SimplifiedChinese,
+                Path.Combine(outputDirectory, "settings-zh-CN.png"));
+            Console.WriteLine("Wrote preview images to " + outputDirectory);
+        }
+
+        private static void WriteSettingsDialogPreview(AppLanguage language, string path)
+        {
+            using (CaptureLimitSettingsDialog dialog = new CaptureLimitSettingsDialog(language, 3))
+            {
+                dialog.StartPosition = FormStartPosition.Manual;
+                dialog.Location = new Point(-10000, -10000);
+                dialog.Show();
+                Application.DoEvents();
+                dialog.PerformLayout();
+                AssertDialogControlsFit(dialog);
+                using (Bitmap preview = new Bitmap(dialog.Width, dialog.Height))
+                {
+                    dialog.DrawToBitmap(preview,
+                        new Rectangle(Point.Empty, preview.Size));
+                    preview.Save(path, System.Drawing.Imaging.ImageFormat.Png);
+                }
+                dialog.Close();
+            }
+        }
+
+        private static void AssertDialogControlsFit(Control parent)
+        {
+            parent.PerformLayout();
+            foreach (Control child in parent.Controls)
+            {
+                Console.WriteLine("Dialog preview control: " + child.GetType().Name +
+                    " " + child.Bounds + " in " + parent.GetType().Name +
+                    " client " + parent.ClientSize);
+                Assert(child.Left >= 0 && child.Top >= 0 &&
+                    child.Right <= parent.ClientSize.Width &&
+                    child.Bottom <= parent.ClientSize.Height,
+                    child.GetType().Name + " should fit in its parent control");
+                AssertDialogControlsFit(child);
+            }
         }
 
         private static void AssertBitmapsEqual(Bitmap expected, Bitmap actual, string message)

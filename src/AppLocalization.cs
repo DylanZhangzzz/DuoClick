@@ -20,6 +20,7 @@ namespace DuoClick
         Pause,
         Resume,
         LanguageMenu,
+        CaptureLimitMenu,
         English,
         SimplifiedChinese,
         Help,
@@ -43,7 +44,14 @@ namespace DuoClick
         HelpTitle,
         OverlayInstruction,
         LanguageLoadFailure,
-        LanguageSaveFailure
+        LanguageSaveFailure,
+        CaptureLimitTitle,
+        CaptureLimitLabel,
+        CaptureLimitExplanation,
+        Save,
+        Cancel,
+        CaptureLimitLoadFailure,
+        CaptureLimitSaveFailure
     }
 
     internal static class AppLocalization
@@ -59,6 +67,7 @@ namespace DuoClick
                 "Pause capture",
                 "Resume capture",
                 "Language / 语言",
+                "Settings",
                 "English",
                 "简体中文",
                 "Help",
@@ -81,11 +90,18 @@ namespace DuoClick
                 "Hold both the left and right mouse buttons. The desktop freezes when you press the second button.\r\n" +
                     "Drag to select an area, then release both buttons to copy it to the clipboard. Press Esc to cancel.\r\n\r\n" +
                     "The screenshot shortcut intercepts the second button in the chord; the first button passes through.\r\n\r\n" +
-                    "Each screenshot is added below the previous one in capture order, and the combined image is copied to the clipboard. Ctrl+V and Shift+Insert still paste normally; when the clipboard contains Duo Click's image, either shortcut also starts a new batch. Another app's clipboard content does not reset the batch. The copied image stays on the clipboard for pasting again. You can also right-click the tray icon and choose Start new batch to clear the in-memory screenshots without changing the clipboard.",
+                    "Screenshots are combined in capture order with numbered headers and separators. Settings lets you keep 1 to 100 screenshots (default: 3); when full, a new screenshot replaces the oldest. Ctrl+V and Shift+Insert still paste normally; when the clipboard contains Duo Click's image, either shortcut also starts a new batch. Another app's clipboard content does not reset the batch. The copied image stays on the clipboard for pasting again. You can also right-click the tray icon and choose Start new batch to clear the in-memory screenshots without changing the clipboard.",
                 "Duo Click Help",
                 "Drag to select · Release both buttons to finish · Esc to cancel",
                 "Could not load the saved language setting. The system language will be used.",
-                "Could not save the language setting. The current language will be used until the app exits."
+                "Could not save the language setting. The current language will be used until the app exits.",
+                "Capture settings",
+                "Maximum screenshots",
+                "When the limit is reached, the newest screenshot replaces the oldest.",
+                "Save",
+                "Cancel",
+                "Could not load the saved capture limit. The default of 3 screenshots will be used.",
+                "Could not save the capture limit. The previous setting remains active."
             },
             new string[]
             {
@@ -96,6 +112,7 @@ namespace DuoClick
                 "暂停截屏",
                 "恢复截屏",
                 "Language / 语言",
+                "设置",
                 "English",
                 "简体中文",
                 "使用说明",
@@ -118,11 +135,18 @@ namespace DuoClick
                 "同时按住鼠标左键和右键。按下第二个键时会冻结桌面并开始选区。\r\n" +
                     "拖动鼠标后松开两个键，选区会复制到剪贴板。按 Esc 可取消。\r\n\r\n" +
                     "组合键中的第二个按键会被截屏功能拦截；第一个按键会照常传递。\r\n\r\n" +
-                    "每张截图都会按截取顺序接在上一张下方，并将合成长图复制到剪贴板。Ctrl+V 和 Shift+Insert 仍会正常粘贴；当剪贴板中是 Duo Click 的长图时，这两个快捷键也会开始新的一组。其他应用复制到剪贴板的内容不会重置当前组。长图会留在剪贴板，可重复粘贴。也可以右键单击托盘图标并选择“开始新一组”，清除内存中的截图而不更改剪贴板。",
+                    "截图按顺序拼成带编号和分界线的长图并复制到剪贴板。可在设置中选择保留 1–100 张（默认 3 张），达到上限后新截图会替换最早的一张。Ctrl+V 和 Shift+Insert 仍会正常粘贴；当剪贴板中是 Duo Click 的长图时，这两个快捷键也会开始新的一组。其他应用复制到剪贴板的内容不会重置当前组。长图会留在剪贴板，可重复粘贴。也可以右键单击托盘图标并选择“开始新一组”，清除内存中的截图而不更改剪贴板。",
                 "Duo Click 使用说明",
                 "拖动选择区域 · 松开左右键完成 · Esc 取消",
                 "无法读取已保存的语言设置，将使用系统语言。",
-                "无法保存语言设置。当前语言将在本次运行中生效。"
+                "无法保存语言设置。当前语言将在本次运行中生效。",
+                "截屏设置",
+                "最多保留截图数",
+                "达到上限后，新截图会替换最早的截图。",
+                "保存",
+                "取消",
+                "无法读取已保存的截图数量，将使用默认值 3。",
+                "无法保存截图数量设置。当前设置保持不变。"
             }
         };
 

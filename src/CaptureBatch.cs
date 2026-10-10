@@ -23,6 +23,13 @@ namespace DuoClick
         internal const int MaximumImages = 100;
         internal const int MaximumDimension = 32767;
         internal const long MaximumPixels = 40000000L;
+        internal const int MinimumCompositeWidth = 96;
+        internal const int CompositeHeaderHeight = 32;
+        internal const int CompositeImageGap = 8;
+        private const int DefaultCapacity = 3;
+        private static readonly Color HeaderColor = Color.FromArgb(240, 240, 240);
+        private static readonly Color HeaderTextColor = Color.FromArgb(30, 55, 80);
+        private static readonly Color HeaderDividerColor = Color.FromArgb(208, 208, 208);
 
         private readonly object _sync = new object();
         private readonly List<Entry> _entries = new List<Entry>();
@@ -32,7 +39,20 @@ namespace DuoClick
         private long _lastReservedSessionId;
         private int _count;
         private int _pendingCount;
+        private int _capacity;
         private bool _disposed;
+
+        internal CaptureBatch()
+            : this(DefaultCapacity)
+        {
+        }
+
+        internal CaptureBatch(int capacity)
+        {
+            if (!IsValidCapacity(capacity))
+                throw new ArgumentOutOfRangeException("capacity");
+            _capacity = capacity;
+        }
 
         internal long Version
         {
@@ -49,6 +69,51 @@ namespace DuoClick
             get { lock (_sync) return _pendingCount; }
         }
 
+        internal int Capacity
+        {
+            get { lock (_sync) return _capacity; }
+        }
+
+        /// <summary>Returns whether a session still has pending or retained work.</summary>
+        internal bool ContainsSession(long sessionId)
+        {
+            lock (_sync)
+            {
+                Entry entry;
+                return !_disposed && _entriesBySession.TryGetValue(sessionId, out entry) &&
+                    (entry.State == EntryState.Pending || entry.State == EntryState.Completed);
+            }
+        }
+
+        /// <summary>
+        /// Changes the number of completed captures retained. A failed change
+        /// leaves the current capacity and owned images untouched.
+        /// </summary>
+        internal bool SetCapacity(int capacity)
+        {
+            if (!IsValidCapacity(capacity))
+                return false;
+
+            lock (_sync)
+            {
+                if (_disposed)
+                    return false;
+                if (capacity == _capacity)
+                    return true;
+
+                int width;
+                long height;
+                if (!TryGetProjectedOutput(capacity, null, Size.Empty, false,
+                    out width, out height))
+                    return false;
+
+                _capacity = capacity;
+                TrimCompletedToCapacity();
+                _version++;
+                return true;
+            }
+        }
+
         /// <summary>
         /// Reserves the crop's place before crop work is queued. The supplied
         /// size is used to reject a batch that cannot fit before allocating it.
@@ -59,7 +124,7 @@ namespace DuoClick
             {
                 if (_disposed || sessionId <= _lastReservedSessionId ||
                     expectedSize.Width <= 0 || expectedSize.Height <= 0 ||
-                    _count + _pendingCount >= MaximumImages ||
+                    _pendingCount >= MaximumImages ||
                     !FitsWithReservation(expectedSize))
                     return false;
 
@@ -101,6 +166,7 @@ namespace DuoClick
                         entry.State = EntryState.Completed;
                         _count++;
                         _pendingCount--;
+                        TrimCompletedToCapacity();
                         _version++;
                         keepImage = true;
                         result = CaptureBatchCompletionResult.Accepted;
@@ -148,6 +214,7 @@ namespace DuoClick
                     return null;
 
                 List<Bitmap> images = new List<Bitmap>(_count);
+                List<int> contentOffsets = new List<int>(_count);
                 int width = 0;
                 long height = 0;
                 long throughSessionId = 0;
@@ -163,13 +230,18 @@ namespace DuoClick
 
                         Bitmap copy = (Bitmap)entry.Image.Clone();
                         images.Add(copy);
+                        if (images.Count > 1)
+                            height += CompositeImageGap;
+                        height += CompositeHeaderHeight;
+                        contentOffsets.Add(checked((int)height));
                         if (copy.Width > width)
                             width = copy.Width;
                         height += copy.Height;
                     }
 
                     return new CaptureBatchSnapshot(this, _version, throughSessionId,
-                        images.ToArray(), width, checked((int)height));
+                        images.ToArray(), contentOffsets.ToArray(),
+                        Math.Max(MinimumCompositeWidth, width), checked((int)height));
                 }
                 catch
                 {
@@ -180,8 +252,8 @@ namespace DuoClick
         }
 
         /// <summary>
-        /// Stacks snapshot images without resizing. Narrower images leave white
-        /// space to their right; every image starts at the left edge.
+        /// Stacks snapshot images without resizing. A neutral numbered header
+        /// precedes each image, with a white gap between image blocks.
         /// </summary>
         internal static Bitmap Compose(CaptureBatchSnapshot snapshot)
         {
@@ -203,12 +275,27 @@ namespace DuoClick
                     graphics.InterpolationMode = InterpolationMode.NearestNeighbor;
                     graphics.SmoothingMode = SmoothingMode.None;
 
-                    int top = 0;
                     Bitmap[] images = snapshot.Images;
                     for (int i = 0; i < images.Length; i++)
                     {
-                        graphics.DrawImageUnscaled(images[i], 0, top);
-                        top += images[i].Height;
+                        int headerTop = snapshot.ContentOffsets[i] - CompositeHeaderHeight;
+                        using (SolidBrush headerBrush = new SolidBrush(HeaderColor))
+                            graphics.FillRectangle(headerBrush, 0, headerTop,
+                                snapshot.Width, CompositeHeaderHeight);
+                        using (Pen divider = new Pen(HeaderDividerColor))
+                            graphics.DrawLine(divider, 0,
+                                headerTop + CompositeHeaderHeight - 1,
+                                snapshot.Width - 1, headerTop + CompositeHeaderHeight - 1);
+                        using (Font font = new Font(FontFamily.GenericSansSerif,
+                            16.0f, FontStyle.Bold, GraphicsUnit.Pixel))
+                        using (SolidBrush textBrush = new SolidBrush(HeaderTextColor))
+                        {
+                            graphics.DrawString((i + 1).ToString(), font, textBrush,
+                                10, headerTop + 6);
+                        }
+
+                        graphics.DrawImageUnscaled(images[i], 0,
+                            snapshot.ContentOffsets[i]);
                     }
                 }
                 return composite;
@@ -292,40 +379,53 @@ namespace DuoClick
 
         private bool FitsWithReservation(Size expectedSize)
         {
-            int width = expectedSize.Width;
-            long height = expectedSize.Height;
-
             if (!IsValidSize(expectedSize))
                 return false;
 
-            for (int i = 0; i < _entries.Count; i++)
-            {
-                Entry entry = _entries[i];
-                if (entry.State == EntryState.Failed || entry.State == EntryState.Removed)
-                    continue;
-                if (entry.ExpectedSize.Width > width)
-                    width = entry.ExpectedSize.Width;
-                height += entry.ExpectedSize.Height;
-                if (height > MaximumDimension)
-                    return false;
-            }
-
-            return IsValidOutput(width, height);
+            int width;
+            long height;
+            return TryGetProjectedOutput(_capacity, null, expectedSize, true,
+                out width, out height);
         }
 
         private bool FitsWithCompletion(Entry target, Size actualSize)
         {
-            int width = 0;
-            long height = 0;
+            int width;
+            long height;
+            return TryGetProjectedOutput(_capacity, target, actualSize, false,
+                out width, out height);
+        }
 
-            for (int i = 0; i < _entries.Count; i++)
+        private bool TryGetProjectedOutput(int capacity, Entry target, Size targetSize,
+            bool includeNewReservation, out int width, out long height)
+        {
+            width = 0;
+            height = 0;
+            int selected = 0;
+
+            // A reservation has a session ID newer than every existing entry,
+            // so project it first, then fill the retained set from newest completed.
+            if (includeNewReservation)
+            {
+                if (!IsValidSize(targetSize))
+                    return false;
+                selected = 1;
+                width = targetSize.Width;
+                height = targetSize.Height;
+            }
+
+            for (int i = _entries.Count - 1; i >= 0 && selected < capacity; i--)
             {
                 Entry entry = _entries[i];
-                if (entry.State == EntryState.Failed || entry.State == EntryState.Removed)
+                bool isTarget = Object.ReferenceEquals(entry, target);
+                if (!isTarget && entry.State != EntryState.Completed)
                     continue;
 
-                Size size = Object.ReferenceEquals(entry, target)
-                    ? actualSize : entry.ExpectedSize;
+                Size size = isTarget ? targetSize : entry.ExpectedSize;
+                if (!IsValidSize(size))
+                    return false;
+
+                selected++;
                 if (size.Width > width)
                     width = size.Width;
                 height += size.Height;
@@ -333,13 +433,25 @@ namespace DuoClick
                     return false;
             }
 
-            return IsValidOutput(width, height);
+            if (selected == 0)
+                return true;
+
+            int canvasWidth = Math.Max(MinimumCompositeWidth, width);
+            long canvasHeight = height +
+                (long)CompositeHeaderHeight * selected +
+                (long)CompositeImageGap * (selected - 1);
+            return IsValidOutput(canvasWidth, canvasHeight);
         }
 
         private static bool IsValidSize(Size size)
         {
             return size.Width > 0 && size.Height > 0 &&
                 size.Width <= MaximumDimension && size.Height <= MaximumDimension;
+        }
+
+        private static bool IsValidCapacity(int capacity)
+        {
+            return capacity >= 1 && capacity <= MaximumImages;
         }
 
         private static bool IsValidOutput(int width, long height)
@@ -398,6 +510,27 @@ namespace DuoClick
             _entries.Remove(entry);
         }
 
+        private void TrimCompletedToCapacity()
+        {
+            for (int i = 0; i < _entries.Count && _count > _capacity; )
+            {
+                Entry entry = _entries[i];
+                if (entry.State != EntryState.Completed)
+                {
+                    i++;
+                    continue;
+                }
+
+                if (entry.Image != null)
+                {
+                    entry.Image.Dispose();
+                    entry.Image = null;
+                }
+                _count--;
+                RemoveEntry(entry);
+            }
+        }
+
         private static void DisposeImages(List<Bitmap> images)
         {
             for (int i = 0; i < images.Count; i++)
@@ -441,14 +574,17 @@ namespace DuoClick
         internal int Height { get; private set; }
         internal bool IsDisposed { get { return _images == null; } }
         internal Bitmap[] Images { get { return _images; } }
+        internal int[] ContentOffsets { get; private set; }
 
         internal CaptureBatchSnapshot(CaptureBatch owner, long version,
-            long throughSessionId, Bitmap[] images, int width, int height)
+            long throughSessionId, Bitmap[] images, int[] contentOffsets,
+            int width, int height)
         {
             Owner = owner;
             Version = version;
             ThroughSessionId = throughSessionId;
             _images = images;
+            ContentOffsets = contentOffsets;
             Width = width;
             Height = height;
         }

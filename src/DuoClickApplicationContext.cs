@@ -21,6 +21,7 @@ namespace DuoClick
         private readonly ToolStripMenuItem _newBatchItem;
         private readonly ToolStripMenuItem _pauseItem;
         private readonly ToolStripMenuItem _languageItem;
+        private readonly ToolStripMenuItem _settingsItem;
         private readonly ToolStripMenuItem _englishItem;
         private readonly ToolStripMenuItem _simplifiedChineseItem;
         private readonly ToolStripMenuItem _helpItem;
@@ -30,6 +31,7 @@ namespace DuoClick
         private readonly ClipboardCopyQueue _clipboardQueue;
         private readonly CaptureBatch _captureBatch;
         private readonly string _languageSettingsPath;
+        private readonly string _captureLimitSettingsPath;
         private readonly TrayStatusModel _trayStatus;
         private readonly Icon _trayIconImage;
         private readonly bool _loadedEmbeddedIcon;
@@ -81,13 +83,17 @@ namespace DuoClick
             string languageSettingsPath)
         {
             _languageSettingsPath = languageSettingsPath;
+            _captureLimitSettingsPath =
+                CaptureLimitSettings.GetPathForLanguageSettingsPath(languageSettingsPath);
             LanguageLoadResult languageLoad = AppLanguageSettings.Load(languageSettingsPath,
                 CultureInfo.CurrentUICulture);
+            CaptureLimitLoadResult captureLimitLoad =
+                CaptureLimitSettings.Load(_captureLimitSettingsPath);
             _language = languageLoad.Language;
             _trayStatus = new TrayStatusModel(_language);
 
             _gesture = new GestureState();
-            _captureBatch = new CaptureBatch();
+            _captureBatch = new CaptureBatch(captureLimitLoad.Capacity);
             _invalidSessions = new HashSet<long>();
             _pendingStarts = new Queue<SelectionStartRequest>();
 
@@ -114,6 +120,8 @@ namespace DuoClick
             _pauseItem = new ToolStripMenuItem();
             _pauseItem.Click += OnPauseClick;
             _languageItem = new ToolStripMenuItem();
+            _settingsItem = new ToolStripMenuItem();
+            _settingsItem.Click += OnSettingsClick;
             _englishItem = new ToolStripMenuItem();
             _englishItem.Click += delegate { ChangeLanguage(AppLanguage.English); };
             _simplifiedChineseItem = new ToolStripMenuItem();
@@ -135,6 +143,7 @@ namespace DuoClick
             _contextMenu.Items.Add(new ToolStripSeparator());
             _contextMenu.Items.Add(_pauseItem);
             _contextMenu.Items.Add(_languageItem);
+            _contextMenu.Items.Add(_settingsItem);
             _contextMenu.Items.Add(_helpItem);
             _contextMenu.Items.Add(new ToolStripSeparator());
             _contextMenu.Items.Add(_exitItem);
@@ -169,6 +178,9 @@ namespace DuoClick
             if (languageLoad.Error != null)
                 ShowNotice(AppLocalization.Get(_language, AppText.LanguageLoadFailure),
                     ToolTipIcon.Warning);
+            if (captureLimitLoad.Error != null)
+                ShowNotice(AppLocalization.Get(_language, AppText.CaptureLimitLoadFailure),
+                    ToolTipIcon.Warning);
         }
 
         internal bool HasSelectionOverlayForTesting
@@ -184,6 +196,16 @@ namespace DuoClick
         internal int BatchCountForTesting
         {
             get { return _captureBatch.Count; }
+        }
+
+        internal int CaptureLimitForTesting
+        {
+            get { return _captureBatch.Capacity; }
+        }
+
+        internal string CaptureLimitSettingsPathForTesting
+        {
+            get { return _captureLimitSettingsPath; }
         }
 
         private bool HasPendingCompositeForTesting
@@ -213,6 +235,12 @@ namespace DuoClick
         internal void ChangeLanguageForTesting(AppLanguage language)
         {
             ChangeLanguage(language);
+        }
+
+        internal bool ApplyCaptureLimitForTesting(int capacity)
+        {
+            Exception error;
+            return TrySaveAndApplyCaptureLimit(capacity, out error);
         }
 
         internal void SetPausedForTesting(bool paused)
@@ -456,6 +484,7 @@ namespace DuoClick
                         if (result != null)
                             result.Dispose();
                         _captureBatch.Fail(completedSessionId);
+                        PruneCaptureClipboardSequences();
                         OnBatchChanged(true);
                         ShowNotice(AppLocalization.Get(_language, AppText.CropFailure),
                             ToolTipIcon.Error);
@@ -696,6 +725,58 @@ namespace DuoClick
             StartNewBatch();
         }
 
+        private void OnSettingsClick(object sender, EventArgs e)
+        {
+            if (_closing || _exitPending)
+                return;
+
+            using (CaptureLimitSettingsDialog dialog = new CaptureLimitSettingsDialog(
+                _language, _captureBatch.Capacity))
+            {
+                if (dialog.ShowDialog() != DialogResult.OK)
+                    return;
+
+                Exception error;
+                if (!TrySaveAndApplyCaptureLimit(dialog.Capacity, out error))
+                    ShowNotice(AppLocalization.Get(_language,
+                        AppText.CaptureLimitSaveFailure), ToolTipIcon.Warning);
+            }
+        }
+
+        private bool TrySaveAndApplyCaptureLimit(int capacity, out Exception error)
+        {
+            try
+            {
+                CaptureLimitSettings.ValidateCapacity(capacity);
+            }
+            catch (Exception validationError)
+            {
+                error = validationError;
+                return false;
+            }
+
+            if (!CaptureLimitSettings.TrySave(_captureLimitSettingsPath, capacity, out error))
+                return false;
+
+            if (capacity == _captureBatch.Capacity)
+                return true;
+
+            if (!_captureBatch.SetCapacity(capacity))
+            {
+                error = new InvalidOperationException(
+                    "The capture limit could not be applied.");
+                return false;
+            }
+
+            PruneCaptureClipboardSequences();
+            // Rebuild through the ordinary sequence-checked publication path.
+            // If another app has changed the clipboard, its sequence will no
+            // longer match a retained capture baseline and nothing is written.
+            OnBatchChanged(_captureBatch.Count > 0);
+            error = null;
+            return true;
+        }
+
         private void ChangeLanguage(AppLanguage language)
         {
             if (_closing || _exitPending)
@@ -720,6 +801,7 @@ namespace DuoClick
             _pauseItem.Text = AppLocalization.Get(_language,
                 _paused ? AppText.Resume : AppText.Pause);
             _languageItem.Text = AppLocalization.Get(_language, AppText.LanguageMenu);
+            _settingsItem.Text = AppLocalization.Get(_language, AppText.CaptureLimitMenu);
             _newBatchItem.Text = AppLocalization.Get(_language, AppText.StartNewBatch);
             _englishItem.Text = AppLocalization.Get(_language, AppText.English);
             _englishItem.Checked = _language == AppLanguage.English;
@@ -816,6 +898,32 @@ namespace DuoClick
             }
             for (int i = 0; i < removed.Count; i++)
                 _captureClipboardSequences.Remove(removed[i]);
+        }
+
+        private void PruneCaptureClipboardSequences()
+        {
+            if (_captureClipboardSequences.Count == 0)
+                return;
+
+            List<long> sessionIds = new List<long>(_captureClipboardSequences.Keys);
+            for (int i = 0; i < sessionIds.Count; i++)
+            {
+                long sessionId = sessionIds[i];
+                if (_captureBatch.ContainsSession(sessionId) ||
+                    sessionId == _selectionSessionId || IsQueuedStart(sessionId))
+                    continue;
+                _captureClipboardSequences.Remove(sessionId);
+            }
+        }
+
+        private bool IsQueuedStart(long sessionId)
+        {
+            foreach (SelectionStartRequest request in _pendingStarts)
+            {
+                if (request.SessionId == sessionId)
+                    return true;
+            }
+            return false;
         }
 
         private uint GetCaptureClipboardSequence(long sessionId, uint fallback)
@@ -1278,6 +1386,7 @@ namespace DuoClick
                 return;
             }
 
+            PruneCaptureClipboardSequences();
             OnBatchChanged(true);
             if (result == CaptureBatchCompletionResult.Rejected)
                 ShowNotice(AppLocalization.Get(_language, AppText.BatchTooLarge),
