@@ -163,14 +163,33 @@ function Assert-ApplicationFiles {
 
     Assert-Condition (Test-Path -LiteralPath $shortcutPath -PathType Leaf) "Start menu shortcut is missing: $shortcutPath"
     $shell = $null
+    $programsFolder = $null
+    $shortcutItem = $null
     $shortcut = $null
     try {
-        $shell = New-Object -ComObject WScript.Shell
-        $shortcut = $shell.CreateShortcut($shortcutPath)
-        $shortcutTarget = [System.IO.Path]::GetFullPath($shortcut.TargetPath)
+        $shell = New-Object -ComObject Shell.Application
+        $programsFolder = $shell.NameSpace([System.IO.Path]::GetDirectoryName($shortcutPath))
+        Assert-Condition ($null -ne $programsFolder) 'Could not open the Start menu Programs folder through Shell.Application.'
+        $shortcutItem = $programsFolder.ParseName([System.IO.Path]::GetFileName($shortcutPath))
+        Assert-Condition ($null -ne $shortcutItem) "Could not read the Start menu shortcut: $shortcutPath"
+        $shortcut = $shortcutItem.GetLink()
+        Assert-Condition ($null -ne $shortcut) "The Start menu item is not a readable shell link: $shortcutPath"
+        $shortcutTargetText = [string]$shortcut.Path
+        if ($shortcutTargetText.StartsWith('"', [System.StringComparison]::Ordinal) -or
+            $shortcutTargetText.EndsWith('"', [System.StringComparison]::Ordinal)) {
+            Assert-Condition ($shortcutTargetText.Length -ge 2 -and
+                $shortcutTargetText.StartsWith('"', [System.StringComparison]::Ordinal) -and
+                $shortcutTargetText.EndsWith('"', [System.StringComparison]::Ordinal)) 'Shortcut target contains unbalanced quotes.'
+            $shortcutTargetText = $shortcutTargetText.Substring(1, $shortcutTargetText.Length - 2)
+        }
+        Assert-Condition (-not [string]::IsNullOrWhiteSpace($shortcutTargetText)) 'Shortcut target is empty.'
+        Assert-Condition (-not $shortcutTargetText.Contains('"')) 'Shortcut target contains embedded quote characters.'
+        $shortcutTarget = [System.IO.Path]::GetFullPath($shortcutTargetText)
         Assert-Condition ($shortcutTarget -ieq [System.IO.Path]::GetFullPath($exePath)) "Shortcut target '$shortcutTarget' does not point to '$exePath'."
     } finally {
         if ($null -ne $shortcut) { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($shortcut) }
+        if ($null -ne $shortcutItem) { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($shortcutItem) }
+        if ($null -ne $programsFolder) { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($programsFolder) }
         if ($null -ne $shell) { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($shell) }
     }
 
