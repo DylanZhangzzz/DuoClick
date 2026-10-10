@@ -3,7 +3,7 @@
 <p align="center"><strong>Two buttons. One screenshot.</strong></p>
 <p align="center">English · <a href="README.zh-CN.md">简体中文</a></p>
 
-A lightweight Windows screenshot tool. Hold both mouse buttons, drag to select, then release both to copy your screenshot. Paste it straight into a chat, document, or image editor.
+A lightweight Windows screenshot tool. Hold both mouse buttons and drag to capture an area. Capture more areas to build one vertical image, then paste the whole sequence into a chat, document, or image editor.
 
 ## Download
 
@@ -18,22 +18,32 @@ Requires Windows 10 / 11 and .NET Framework 4.8.
 1. Find Duo Click's blue-and-teal mouse icon in the system tray (it may be under the **^** arrow).
 2. At the starting point, hold down **both the left and right mouse buttons**. Either button can go first.
 3. Drag to select an area.
-4. Release **both** buttons. Your screenshot is copied to the clipboard.
-5. Press **Ctrl + V** in an app that accepts images.
+4. Release **both** buttons. Your screenshot joins the current batch on the clipboard.
+5. Repeat to capture more areas. They stack **top to bottom in capture order**, at their original sizes. The tray shows the count.
+6. Press **Ctrl + V** or **Shift + Insert** in an app that accepts images. The batch counter resets, and your next capture starts a new image.
 
 Press **Esc** to cancel. This gesture means holding the two buttons together, not double-clicking one button.
 
 ## Language and controls
 
-Right-click the tray icon to pause or resume capture, read the instructions, or exit. Under **Language / 语言**, choose **English** or **简体中文**. The change takes effect immediately and is remembered for your next launch. The first launch follows your Windows display language (Chinese or English).
+Right-click the tray icon to see the current count, start a new batch, pause or resume capture, read the instructions, or exit. Under **Language / 语言**, choose **English** or **简体中文**. The change takes effect immediately and is remembered for your next launch. The first launch follows your Windows display language (Chinese or English).
 
 The tray tooltip briefly confirms a successful copy, then returns to the current ready or paused state.
+
+## Capture a sequence
+
+For example, capture three areas and paste once: you get **one long image containing all three**, in order. Narrower captures are aligned left on a white background; images are not resized.
+
+The counter resets when Duo Click observes **Ctrl + V** or **Shift + Insert** while its image is still on the clipboard. It cannot confirm that the destination accepted the paste. The finished image stays on the clipboard, so you can paste it again, even if the first attempt did not work.
+
+Right-click/menu paste cannot be detected reliably across apps. After using it, choose **Start new batch** from the tray menu. This clears the pending group without erasing the image already on the clipboard. Copying other content does not reset the capture count.
 
 ## Good to know
 
 - Screenshots stay on your computer. Duo Click does not upload them or save image files automatically.
 - Ordinary mouse clicks still work. The first button press can reach the app underneath, so choose your starting point with care.
 - Canceling or selecting a tiny area keeps your previous clipboard content.
+- A batch supports up to 100 captures, subject to a 40-million-pixel canvas limit and a 32,767-pixel limit on either dimension. If the next capture would exceed these limits, it is rejected with a notice and the existing batch is kept.
 - The desktop is captured just before the selection overlay appears; moving content may differ slightly from the instant you press the buttons.
 - Protected video, the Windows secure desktop, and apps that block capture may not be captured. Mixed-scale multi-monitor setups still need further device testing.
 - Updating? Exit the older Duo Click from its tray menu before opening the new copy.

@@ -24,6 +24,13 @@ namespace DuoClick
         private const int WmSysKeyDown = 0x0104;
         private const int WmSysKeyUp = 0x0105;
         private const int VkEscape = 0x1B;
+        private const int VkInsert = 0x2D;
+        private const int VkV = 0x56;
+        private const int VkControl = 0x11;
+        private const int VkShift = 0x10;
+        private const int VkMenu = 0x12;
+        private const int VkLeftWindows = 0x5B;
+        private const int VkRightWindows = 0x5C;
         private const uint MouseInjectedFlag = 0x00000001;
         private const uint KeyboardInjectedFlag = 0x00000010;
         private const uint LowerIntegrityInjectedFlag = 0x00000002;
@@ -31,29 +38,35 @@ namespace DuoClick
         private readonly Control _dispatcher;
         private readonly GestureState _gesture;
         private readonly Func<bool> _isEnabled;
-        private readonly Action<long, Point> _onStarted;
+        private readonly Action<long, Point, uint, long> _onStarted;
+        private readonly Func<long> _getBatchEpoch;
         private readonly Action<long, Point> _onCompleted;
         private readonly Action<long> _onCancelled;
         private readonly Action _onAllReleased;
+        private readonly Action<uint> _onPasteShortcut;
         private readonly HookProcedure _mouseProcedure;
         private readonly HookProcedure _keyboardProcedure;
         private IntPtr _mouseHook;
         private IntPtr _keyboardHook;
         private bool _escapeWasSwallowed;
+        private readonly PasteShortcutState _pasteShortcutState = new PasteShortcutState();
         private bool _disposed;
 
         internal LowLevelInputHooks(Control dispatcher, GestureState gesture,
-            Func<bool> isEnabled, Action<long, Point> onStarted,
+            Func<bool> isEnabled, Action<long, Point, uint, long> onStarted,
             Action<long, Point> onCompleted, Action<long> onCancelled,
-            Action onAllReleased)
+            Action onAllReleased, Action<uint> onPasteShortcut,
+            Func<long> getBatchEpoch)
         {
             _dispatcher = dispatcher;
             _gesture = gesture;
             _isEnabled = isEnabled;
             _onStarted = onStarted;
+            _getBatchEpoch = getBatchEpoch;
             _onCompleted = onCompleted;
             _onCancelled = onCancelled;
             _onAllReleased = onAllReleased;
+            _onPasteShortcut = onPasteShortcut;
             _mouseProcedure = MouseHookCallback;
             _keyboardProcedure = KeyboardHookCallback;
 
@@ -90,7 +103,14 @@ namespace DuoClick
                         if (transition.Started)
                         {
                             Point point = new Point(transition.X, transition.Y);
-                            Post(delegate { _onStarted(transition.SessionId, point); });
+                            uint clipboardSequence = GetClipboardSequenceNumber();
+                            long batchEpoch = _getBatchEpoch == null
+                                ? 0 : _getBatchEpoch();
+                            Post(delegate
+                            {
+                                _onStarted(transition.SessionId, point,
+                                    clipboardSequence, batchEpoch);
+                            });
                         }
                         if (transition.Completed)
                         {
@@ -116,33 +136,63 @@ namespace DuoClick
                 int messageId = message.ToInt32();
                 LowLevelKeyboardData input = (LowLevelKeyboardData)Marshal.PtrToStructure(
                     data, typeof(LowLevelKeyboardData));
-                if (!IsKeyboardInjected(input.Flags) && input.VirtualKey == VkEscape)
+                if (!IsKeyboardInjected(input.Flags))
                 {
-                    if (_escapeWasSwallowed &&
-                        (messageId == WmKeyDown || messageId == WmSysKeyDown))
-                        return new IntPtr(1);
-
-                    if (_escapeWasSwallowed &&
-                        (messageId == WmKeyUp || messageId == WmSysKeyUp))
+                    if (input.VirtualKey == VkEscape)
                     {
-                        _escapeWasSwallowed = false;
-                        return new IntPtr(1);
-                    }
+                        if (_escapeWasSwallowed &&
+                            (messageId == WmKeyDown || messageId == WmSysKeyDown))
+                            return new IntPtr(1);
 
-                    if (messageId == WmKeyDown || messageId == WmSysKeyDown)
-                    {
-                        long session = _gesture.CancelCurrent();
-                        if (session != 0)
+                        if (_escapeWasSwallowed &&
+                            (messageId == WmKeyUp || messageId == WmSysKeyUp))
                         {
-                            _escapeWasSwallowed = true;
-                            Post(delegate { _onCancelled(session); });
+                            _escapeWasSwallowed = false;
                             return new IntPtr(1);
                         }
+
+                        if (messageId == WmKeyDown || messageId == WmSysKeyDown)
+                        {
+                            long session = _gesture.CancelCurrent();
+                            if (session != 0)
+                            {
+                                _escapeWasSwallowed = true;
+                                Post(delegate { _onCancelled(session); });
+                                return new IntPtr(1);
+                            }
+                        }
                     }
+
+                    ObservePasteShortcut(messageId, input);
                 }
             }
 
             return CallNextHookEx(_keyboardHook, code, message, data);
+        }
+
+        private void ObservePasteShortcut(int messageId, LowLevelKeyboardData input)
+        {
+            bool isDown = messageId == WmKeyDown || messageId == WmSysKeyDown;
+            bool isUp = messageId == WmKeyUp || messageId == WmSysKeyUp;
+            if (!isDown && !isUp)
+                return;
+
+            bool paste = _pasteShortcutState.Observe(unchecked((int)input.VirtualKey),
+                isDown, isUp, IsKeyDown(VkControl), IsKeyDown(VkShift),
+                IsKeyDown(VkMenu), IsKeyDown(VkLeftWindows) || IsKeyDown(VkRightWindows));
+
+            // A held key generates repeated keydown messages. Observe only its
+            // first edge and always let Windows deliver the shortcut.
+            if (paste && _onPasteShortcut != null)
+            {
+                uint clipboardSequence = GetClipboardSequenceNumber();
+                Post(delegate { _onPasteShortcut(clipboardSequence); });
+            }
+        }
+
+        private static bool IsKeyDown(int virtualKey)
+        {
+            return (GetAsyncKeyState(virtualKey) & unchecked((short)0x8000)) != 0;
         }
 
         private void Post(MethodInvoker action)
@@ -254,5 +304,11 @@ namespace DuoClick
 
         [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
         private static extern IntPtr GetModuleHandle(string moduleName);
+
+        [DllImport("user32.dll")]
+        private static extern short GetAsyncKeyState(int virtualKey);
+
+        [DllImport("user32.dll")]
+        private static extern uint GetClipboardSequenceNumber();
     }
 }

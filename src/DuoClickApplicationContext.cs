@@ -17,6 +17,8 @@ namespace DuoClick
         private readonly NotifyIcon _trayIcon;
         private readonly ContextMenuStrip _contextMenu;
         private readonly ToolStripMenuItem _headerItem;
+        private readonly ToolStripMenuItem _batchCountItem;
+        private readonly ToolStripMenuItem _newBatchItem;
         private readonly ToolStripMenuItem _pauseItem;
         private readonly ToolStripMenuItem _languageItem;
         private readonly ToolStripMenuItem _englishItem;
@@ -26,26 +28,42 @@ namespace DuoClick
         private readonly WinFormsTimer _selectionTimer;
         private readonly WinFormsTimer _trayFeedbackTimer;
         private readonly ClipboardCopyQueue _clipboardQueue;
+        private readonly CaptureBatch _captureBatch;
         private readonly string _languageSettingsPath;
         private readonly TrayStatusModel _trayStatus;
         private readonly Icon _trayIconImage;
         private readonly bool _loadedEmbeddedIcon;
         private readonly HashSet<long> _invalidSessions;
         private readonly Queue<SelectionStartRequest> _pendingStarts;
+        private readonly Dictionary<long, uint> _captureClipboardSequences =
+            new Dictionary<long, uint>();
+        private readonly Queue<uint> _clipboardSequenceRebaseOrder = new Queue<uint>();
+        private readonly Dictionary<uint, uint> _clipboardSequenceRebases =
+            new Dictionary<uint, uint>();
+        private readonly object _compositeSync = new object();
         private LowLevelInputHooks _hooks;
         private SelectionOverlay _overlay;
         private Bitmap _frozenDesktop;
         private Rectangle _desktopBounds;
         private Point _selectionStart;
         private long _selectionSessionId;
+        private long _selectionBatchEpoch;
+        private long _batchEpoch;
         private long _nextTestSessionId = 1000000;
         private bool _hasPendingFinish;
         private Point _pendingFinishPoint;
         private bool _paused;
         private bool _exitPending;
         private bool _closing;
-        private long _latestClipboardSessionId;
+        private bool _compositeWorkerRunning;
+        private bool _compositeRequested;
+        private long _compositeRequestId;
+        private long _latestPublishedBoundary;
+        private uint _lastSuccessfulClipboardSequence;
+        private bool _hasSuccessfulClipboardPublication;
         private AppLanguage _language;
+
+        private const int MaxClipboardSequenceRebases = 128;
 
         internal DuoClickApplicationContext()
             : this(true, true)
@@ -69,6 +87,7 @@ namespace DuoClick
             _trayStatus = new TrayStatusModel(_language);
 
             _gesture = new GestureState();
+            _captureBatch = new CaptureBatch();
             _invalidSessions = new HashSet<long>();
             _pendingStarts = new Queue<SelectionStartRequest>();
 
@@ -83,10 +102,15 @@ namespace DuoClick
             _trayFeedbackTimer.Interval = 2000;
             _trayFeedbackTimer.Tick += OnTrayFeedbackTimerTick;
 
-            _clipboardQueue = new ClipboardCopyQueue(OnClipboardCopied, OnClipboardFailed);
+            _clipboardQueue = new ClipboardCopyQueue(OnClipboardCopied, OnClipboardFailed,
+                GetClipboardSequenceNumber);
 
             _headerItem = new ToolStripMenuItem();
             _headerItem.Enabled = false;
+            _batchCountItem = new ToolStripMenuItem();
+            _batchCountItem.Enabled = false;
+            _newBatchItem = new ToolStripMenuItem();
+            _newBatchItem.Click += OnNewBatchClick;
             _pauseItem = new ToolStripMenuItem();
             _pauseItem.Click += OnPauseClick;
             _languageItem = new ToolStripMenuItem();
@@ -106,6 +130,8 @@ namespace DuoClick
 
             _contextMenu = new ContextMenuStrip();
             _contextMenu.Items.Add(_headerItem);
+            _contextMenu.Items.Add(_batchCountItem);
+            _contextMenu.Items.Add(_newBatchItem);
             _contextMenu.Items.Add(new ToolStripSeparator());
             _contextMenu.Items.Add(_pauseItem);
             _contextMenu.Items.Add(_languageItem);
@@ -113,6 +139,8 @@ namespace DuoClick
             _contextMenu.Items.Add(new ToolStripSeparator());
             _contextMenu.Items.Add(_exitItem);
             UpdateMenuLanguage();
+            UpdateBatchCountMenu();
+            UpdateTrayTooltip();
 
             _trayIcon = new NotifyIcon();
             _trayIconImage = AppTrayIcon.Load(out _loadedEmbeddedIcon);
@@ -127,7 +155,9 @@ namespace DuoClick
                 {
                     _hooks = new LowLevelInputHooks(_dispatcher, _gesture,
                         delegate { return !_paused && !_exitPending && !_closing; },
-                        BeginSelection, CompleteSelection, CancelSelection, OnButtonsDrained);
+                        BeginSelection, CompleteSelection, CancelSelection, OnButtonsDrained,
+                        OnPasteShortcutObserved,
+                        delegate { return Interlocked.Read(ref _batchEpoch); });
                 }
                 catch (Exception ex)
                 {
@@ -148,7 +178,21 @@ namespace DuoClick
 
         internal bool HasPendingClipboardCopyForTesting
         {
-            get { return _clipboardQueue.HasPendingItems; }
+            get { return _clipboardQueue.HasPendingItems || HasPendingCompositeForTesting; }
+        }
+
+        internal int BatchCountForTesting
+        {
+            get { return _captureBatch.Count; }
+        }
+
+        private bool HasPendingCompositeForTesting
+        {
+            get
+            {
+                lock (_compositeSync)
+                    return _compositeWorkerRunning || _compositeRequested;
+            }
         }
 
         internal AppLanguage LanguageForTesting
@@ -181,6 +225,26 @@ namespace DuoClick
             UpdateTrayTooltip();
         }
 
+        internal void StartNewBatchForTesting()
+        {
+            StartNewBatch();
+        }
+
+        internal void ClearBatchForTesting()
+        {
+            StartNewBatch();
+        }
+
+        internal uint ClipboardSequenceForTesting
+        {
+            get { return GetClipboardSequenceNumber(); }
+        }
+
+        internal void ObservePasteShortcutForTesting(uint sequence)
+        {
+            OnPasteShortcutObserved(sequence);
+        }
+
         internal void ShowCopiedFeedbackForTesting()
         {
             _trayStatus.ShowCopied();
@@ -195,18 +259,31 @@ namespace DuoClick
             UpdateTrayTooltip();
         }
 
-        private void BeginSelection(long sessionId, Point start)
+        private void BeginSelection(long sessionId, Point start, uint clipboardSequence,
+            long batchEpoch)
         {
-            if (_closing || _exitPending || _paused || _invalidSessions.Remove(sessionId))
-                return;
-
-            if (_selectionSessionId != 0)
+            if (_closing || _exitPending || _paused || batchEpoch != _batchEpoch ||
+                _invalidSessions.Remove(sessionId))
             {
-                _pendingStarts.Enqueue(new SelectionStartRequest(sessionId, start));
+                _captureClipboardSequences.Remove(sessionId);
+                _invalidSessions.Remove(sessionId);
                 return;
             }
 
+            _captureClipboardSequences[sessionId] =
+                NormalizeClipboardSequence(clipboardSequence);
+            clipboardSequence = _captureClipboardSequences[sessionId];
+
+            if (_selectionSessionId != 0)
+            {
+                _pendingStarts.Enqueue(new SelectionStartRequest(sessionId, start,
+                    clipboardSequence, batchEpoch));
+                return;
+            }
+
+            _captureClipboardSequences[sessionId] = clipboardSequence;
             _selectionSessionId = sessionId;
+            _selectionBatchEpoch = batchEpoch;
             _selectionStart = start;
             _hasPendingFinish = false;
 
@@ -319,6 +396,7 @@ namespace DuoClick
 
             Rectangle cropRectangle = SelectionGeometry.GetRectangle(
                 _desktopBounds, _selectionStart, end);
+            long captureBatchEpoch = _selectionBatchEpoch;
             Rectangle capturedBounds = _desktopBounds;
             Bitmap source = _frozenDesktop;
             _frozenDesktop = null;
@@ -326,10 +404,31 @@ namespace DuoClick
 
             if (!SelectionGeometry.IsLargeEnough(cropRectangle))
             {
+                _captureClipboardSequences.Remove(sessionId);
                 source.Dispose();
                 ProcessQueuedStarts();
                 return;
             }
+
+            if (captureBatchEpoch != _batchEpoch)
+            {
+                _captureClipboardSequences.Remove(sessionId);
+                source.Dispose();
+                ProcessQueuedStarts();
+                return;
+            }
+
+            if (!_captureBatch.Reserve(sessionId, cropRectangle.Size))
+            {
+                _captureClipboardSequences.Remove(sessionId);
+                source.Dispose();
+                ShowNotice(AppLocalization.Get(_language, AppText.BatchTooLarge),
+                    ToolTipIcon.Warning);
+                ProcessQueuedStarts();
+                return;
+            }
+
+            OnBatchChanged(false);
 
             ProcessQueuedStarts();
             ThreadPool.QueueUserWorkItem(delegate
@@ -356,12 +455,14 @@ namespace DuoClick
                     {
                         if (result != null)
                             result.Dispose();
+                        _captureBatch.Fail(completedSessionId);
+                        OnBatchChanged(true);
                         ShowNotice(AppLocalization.Get(_language, AppText.CropFailure),
                             ToolTipIcon.Error);
                         return;
                     }
 
-                    PublishCrop(completedSessionId, result);
+                    CompleteCrop(completedSessionId, result);
                 });
                 if (!posted && result != null)
                     result.Dispose();
@@ -370,6 +471,7 @@ namespace DuoClick
 
         private void CancelSelection(long sessionId)
         {
+            _captureClipboardSequences.Remove(sessionId);
             if (_selectionSessionId == sessionId)
             {
                 ClearSelectionResources();
@@ -387,6 +489,7 @@ namespace DuoClick
 
         private void FailSelection(long sessionId, string message)
         {
+            _captureClipboardSequences.Remove(sessionId);
             _invalidSessions.Add(sessionId);
             if (_selectionSessionId == sessionId)
             {
@@ -411,6 +514,7 @@ namespace DuoClick
                 _frozenDesktop = null;
             }
             _selectionSessionId = 0;
+            _selectionBatchEpoch = 0;
             _hasPendingFinish = false;
         }
 
@@ -475,17 +579,35 @@ namespace DuoClick
             {
                 SelectionStartRequest request = _pendingStarts.Dequeue();
                 if (_invalidSessions.Remove(request.SessionId))
+                {
+                    _captureClipboardSequences.Remove(request.SessionId);
                     continue;
+                }
+                if (request.BatchEpoch != _batchEpoch)
+                {
+                    _captureClipboardSequences.Remove(request.SessionId);
+                    continue;
+                }
                 if (request.WaitForTestCapture)
                 {
+                    if (!_captureClipboardSequences.ContainsKey(request.SessionId))
+                        _captureClipboardSequences[request.SessionId] =
+                            NormalizeClipboardSequence(request.ClipboardSequence);
+                    else
+                        _captureClipboardSequences[request.SessionId] =
+                            NormalizeClipboardSequence(
+                                _captureClipboardSequences[request.SessionId]);
                     _selectionSessionId = request.SessionId;
+                    _selectionBatchEpoch = request.BatchEpoch;
                     _selectionStart = request.Start;
                     _desktopBounds = request.DesktopBounds;
                     _hasPendingFinish = false;
                 }
                 else
                 {
-                    BeginSelection(request.SessionId, request.Start);
+                    BeginSelection(request.SessionId, request.Start,
+                        GetCaptureClipboardSequence(request.SessionId,
+                            request.ClipboardSequence), request.BatchEpoch);
                 }
                 if (request.HasCompletion)
                     CompleteSelection(request.SessionId, request.End);
@@ -504,6 +626,8 @@ namespace DuoClick
                 SelectionStartRequest request = _pendingStarts.Dequeue();
                 if (request.SessionId != sessionId)
                     retained.Enqueue(request);
+                else
+                    _captureClipboardSequences.Remove(request.SessionId);
             }
             while (retained.Count > 0)
                 _pendingStarts.Enqueue(retained.Dequeue());
@@ -567,6 +691,11 @@ namespace DuoClick
                 MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
 
+        private void OnNewBatchClick(object sender, EventArgs e)
+        {
+            StartNewBatch();
+        }
+
         private void ChangeLanguage(AppLanguage language)
         {
             if (_closing || _exitPending)
@@ -591,6 +720,7 @@ namespace DuoClick
             _pauseItem.Text = AppLocalization.Get(_language,
                 _paused ? AppText.Resume : AppText.Pause);
             _languageItem.Text = AppLocalization.Get(_language, AppText.LanguageMenu);
+            _newBatchItem.Text = AppLocalization.Get(_language, AppText.StartNewBatch);
             _englishItem.Text = AppLocalization.Get(_language, AppText.English);
             _englishItem.Checked = _language == AppLanguage.English;
             _simplifiedChineseItem.Text = AppLocalization.Get(_language,
@@ -598,12 +728,286 @@ namespace DuoClick
             _simplifiedChineseItem.Checked = _language == AppLanguage.SimplifiedChinese;
             _helpItem.Text = AppLocalization.Get(_language, AppText.Help);
             _exitItem.Text = AppLocalization.Get(_language, AppText.Exit);
+            UpdateBatchCountMenu();
+        }
+
+        private void UpdateBatchCountMenu()
+        {
+            if (_batchCountItem == null || _captureBatch == null)
+                return;
+
+            string count = _captureBatch.Count.ToString(CultureInfo.InvariantCulture);
+            _batchCountItem.Text = String.Format(CultureInfo.InvariantCulture,
+                AppLocalization.Get(_language, AppText.BatchCount), count);
         }
 
         private void UpdateTrayTooltip()
         {
+            if (_trayStatus != null && _captureBatch != null)
+                _trayStatus.SetCount(_captureBatch.Count);
             if (_trayIcon != null)
                 _trayIcon.Text = _trayStatus.Text;
+        }
+
+        private void OnBatchChanged(bool requestComposite)
+        {
+            InvalidateCompositeJobs(true);
+            _trayFeedbackTimer.Stop();
+            _trayStatus.ClearFeedback();
+            UpdateBatchCountMenu();
+            UpdateTrayTooltip();
+            if (requestComposite && !_closing)
+                RequestComposite();
+        }
+
+        private void StartNewBatch()
+        {
+            if (_closing || _exitPending)
+                return;
+
+            // A start or queued start belongs to the previous group. Invalidate
+            // its UI callbacks before clearing the model so a delayed desktop
+            // capture cannot reserve itself in the fresh group.
+            Interlocked.Increment(ref _batchEpoch);
+            _gesture.CancelCurrent();
+            _invalidSessions.Clear();
+            _pendingStarts.Clear();
+            _captureClipboardSequences.Clear();
+            _clipboardSequenceRebaseOrder.Clear();
+            _clipboardSequenceRebases.Clear();
+            if (_selectionSessionId != 0)
+                ClearSelectionResources();
+
+            _captureBatch.Clear();
+            _latestPublishedBoundary = 0;
+            _hasSuccessfulClipboardPublication = false;
+            _trayFeedbackTimer.Stop();
+            _trayStatus.ClearFeedback();
+            OnBatchChanged(false);
+        }
+
+        private void OnPasteShortcutObserved(uint clipboardSequence)
+        {
+            if (_closing || !_hasSuccessfulClipboardPublication ||
+                clipboardSequence != _lastSuccessfulClipboardSequence ||
+                GetClipboardSequenceNumber() != _lastSuccessfulClipboardSequence)
+                return;
+
+            long boundary = _latestPublishedBoundary;
+            InvalidateCompositeJobs(true);
+            _captureBatch.ResetThrough(boundary);
+            RemoveCaptureClipboardSequencesThrough(boundary);
+            _hasSuccessfulClipboardPublication = false;
+            _trayFeedbackTimer.Stop();
+            _trayStatus.ClearFeedback();
+            UpdateBatchCountMenu();
+            UpdateTrayTooltip();
+            // Keep the published bitmap on the clipboard. Any captures after
+            // this publication boundary remain in memory until the next capture.
+        }
+
+        private void RemoveCaptureClipboardSequencesThrough(long boundarySessionId)
+        {
+            List<long> removed = new List<long>();
+            foreach (KeyValuePair<long, uint> entry in _captureClipboardSequences)
+            {
+                if (entry.Key <= boundarySessionId)
+                    removed.Add(entry.Key);
+            }
+            for (int i = 0; i < removed.Count; i++)
+                _captureClipboardSequences.Remove(removed[i]);
+        }
+
+        private uint GetCaptureClipboardSequence(long sessionId, uint fallback)
+        {
+            uint sequence;
+            sequence = _captureClipboardSequences.TryGetValue(sessionId, out sequence)
+                ? sequence : fallback;
+            sequence = NormalizeClipboardSequence(sequence);
+            if (_captureClipboardSequences.ContainsKey(sessionId))
+                _captureClipboardSequences[sessionId] = sequence;
+            return sequence;
+        }
+
+        private uint NormalizeClipboardSequence(uint sequence)
+        {
+            uint original = sequence;
+            HashSet<uint> visited = new HashSet<uint>();
+            for (int i = 0; i < MaxClipboardSequenceRebases; i++)
+            {
+                if (!visited.Add(sequence))
+                    return original;
+
+                uint publishedSequence;
+                if (!_clipboardSequenceRebases.TryGetValue(sequence,
+                    out publishedSequence))
+                    return sequence;
+                sequence = publishedSequence;
+            }
+            return sequence;
+        }
+
+        private void RequestComposite()
+        {
+            bool startWorker = false;
+            lock (_compositeSync)
+            {
+                _compositeRequestId++;
+                _compositeRequested = true;
+                if (!_compositeWorkerRunning)
+                {
+                    _compositeWorkerRunning = true;
+                    startWorker = true;
+                }
+            }
+
+            _clipboardQueue.CancelPending();
+            if (startWorker && !ThreadPool.QueueUserWorkItem(CompositeWorker))
+            {
+                lock (_compositeSync)
+                {
+                    _compositeRequested = false;
+                    _compositeWorkerRunning = false;
+                }
+                ShowNotice(AppLocalization.Get(_language, AppText.CompositeFailure),
+                    ToolTipIcon.Error);
+            }
+        }
+
+        private void InvalidateCompositeJobs(bool cancelPublication)
+        {
+            lock (_compositeSync)
+            {
+                _compositeRequestId++;
+                _compositeRequested = false;
+            }
+            if (cancelPublication && _clipboardQueue != null)
+                _clipboardQueue.CancelPending();
+        }
+
+        private void CompositeWorker(object state)
+        {
+            while (true)
+            {
+                long requestId;
+                lock (_compositeSync)
+                {
+                    if (_closing || !_compositeRequested)
+                    {
+                        _compositeWorkerRunning = false;
+                        return;
+                    }
+                    requestId = _compositeRequestId;
+                    _compositeRequested = false;
+                }
+
+                CaptureBatchSnapshot snapshot = null;
+                Bitmap composite = null;
+                Exception composeError = null;
+                try
+                {
+                    snapshot = _captureBatch.CreateSnapshot();
+                    if (snapshot != null)
+                        composite = CaptureBatch.Compose(snapshot);
+                }
+                catch (Exception error)
+                {
+                    composeError = error;
+                }
+
+                bool retryLatest = false;
+                bool isCurrent = false;
+                lock (_compositeSync)
+                {
+                    if (_compositeRequestId != requestId || _compositeRequested)
+                    {
+                        retryLatest = _compositeRequested;
+                        if (!retryLatest)
+                            _compositeWorkerRunning = false;
+                    }
+                    else
+                    {
+                        _compositeWorkerRunning = false;
+                        isCurrent = true;
+                    }
+                }
+
+                if (!isCurrent)
+                {
+                    if (composite != null)
+                        composite.Dispose();
+                    if (snapshot != null)
+                        snapshot.Dispose();
+                    if (retryLatest)
+                        continue;
+                    return;
+                }
+
+                if (snapshot == null && composeError == null)
+                    return;
+
+                CaptureBatchSnapshot completedSnapshot = snapshot;
+                Bitmap completedComposite = composite;
+                Exception completedError = composeError;
+                long completedRequestId = requestId;
+                bool posted = PostToUi(delegate
+                {
+                    OnCompositeReady(completedSnapshot, completedComposite,
+                        completedRequestId, completedError);
+                });
+                if (!posted)
+                {
+                    if (completedComposite != null)
+                        completedComposite.Dispose();
+                    if (completedSnapshot != null)
+                        completedSnapshot.Dispose();
+                }
+                return;
+            }
+        }
+
+        private void OnCompositeReady(CaptureBatchSnapshot snapshot, Bitmap composite,
+            long requestId, Exception composeError)
+        {
+            if (composeError != null)
+            {
+                if (snapshot != null)
+                    snapshot.Dispose();
+                if (!_closing && IsCompositeRequestCurrent(requestId))
+                    ShowNotice(AppLocalization.Get(_language, AppText.CompositeFailure),
+                        ToolTipIcon.Error);
+                return;
+            }
+
+            if (_closing || snapshot == null || composite == null ||
+                !IsCompositeRequestCurrent(requestId) ||
+                !_captureBatch.IsSnapshotCurrent(snapshot))
+            {
+                if (composite != null)
+                    composite.Dispose();
+                if (snapshot != null)
+                    snapshot.Dispose();
+                return;
+            }
+
+            uint expectedClipboardSequence = GetCaptureClipboardSequence(
+                snapshot.ThroughSessionId, GetClipboardSequenceNumber());
+            if (GetClipboardSequenceNumber() != expectedClipboardSequence)
+            {
+                composite.Dispose();
+                snapshot.Dispose();
+                return;
+            }
+
+            _clipboardQueue.Enqueue(composite, expectedClipboardSequence,
+                snapshot.ThroughSessionId, snapshot.Version, requestId);
+            snapshot.Dispose();
+        }
+
+        private bool IsCompositeRequestCurrent(long requestId)
+        {
+            lock (_compositeSync)
+                return requestId == _compositeRequestId;
         }
 
         private void RestartTrayFeedbackTimer()
@@ -661,7 +1065,9 @@ namespace DuoClick
                 _hooks.Dispose();
                 _hooks = null;
             }
+            InvalidateCompositeJobs(false);
             _clipboardQueue.Dispose();
+            _captureBatch.Dispose();
             _selectionTimer.Dispose();
             _trayFeedbackTimer.Stop();
             _trayFeedbackTimer.Dispose();
@@ -672,14 +1078,50 @@ namespace DuoClick
             _dispatcher.Dispose();
         }
 
-        private void OnClipboardCopied()
+        private void OnClipboardCopied(long boundarySessionId, long batchVersion,
+            long requestId, uint expectedClipboardSequence, uint clipboardSequence)
         {
-            if (_closing)
+            if (_closing || !IsCompositeRequestCurrent(requestId) ||
+                _captureBatch.Version != batchVersion ||
+                GetClipboardSequenceNumber() != clipboardSequence)
                 return;
+            RecordClipboardSequenceRebase(expectedClipboardSequence, clipboardSequence);
+            RebaseCaptureClipboardSequences(expectedClipboardSequence, clipboardSequence);
+            _latestPublishedBoundary = boundarySessionId;
+            _lastSuccessfulClipboardSequence = clipboardSequence;
+            _hasSuccessfulClipboardPublication = true;
             _trayStatus.ShowCopied();
             UpdateTrayTooltip();
             RestartTrayFeedbackTimer();
             ShowNotice(AppLocalization.Get(_language, AppText.NoticeCopied), ToolTipIcon.Info);
+        }
+
+        private void RebaseCaptureClipboardSequences(uint expectedSequence,
+            uint publishedSequence)
+        {
+            List<long> sessionIds = new List<long>(_captureClipboardSequences.Keys);
+            for (int i = 0; i < sessionIds.Count; i++)
+            {
+                long sessionId = sessionIds[i];
+                if (_captureClipboardSequences[sessionId] == expectedSequence)
+                    _captureClipboardSequences[sessionId] = publishedSequence;
+            }
+        }
+
+        private void RecordClipboardSequenceRebase(uint expectedSequence,
+            uint publishedSequence)
+        {
+            if (expectedSequence == publishedSequence)
+                return;
+
+            if (!_clipboardSequenceRebases.ContainsKey(expectedSequence))
+                _clipboardSequenceRebaseOrder.Enqueue(expectedSequence);
+            _clipboardSequenceRebases[expectedSequence] = publishedSequence;
+            while (_clipboardSequenceRebaseOrder.Count > MaxClipboardSequenceRebases)
+            {
+                uint oldestSequence = _clipboardSequenceRebaseOrder.Dequeue();
+                _clipboardSequenceRebases.Remove(oldestSequence);
+            }
         }
 
         private void OnClipboardFailed()
@@ -705,6 +1147,9 @@ namespace DuoClick
             catch (InvalidOperationException) { }
         }
 
+        [DllImport("user32.dll")]
+        private static extern uint GetClipboardSequenceNumber();
+
         // Focused integration seam: tests can exercise selection completion with
         // a synthetic frozen image without installing process-wide input hooks.
         internal long BeginSelectionWithImageForTesting(Bitmap image, Rectangle desktopBounds,
@@ -718,8 +1163,10 @@ namespace DuoClick
             ClearSelectionResources();
             long session = ++_nextTestSessionId;
             _selectionSessionId = session;
+            _selectionBatchEpoch = _batchEpoch;
             _desktopBounds = desktopBounds;
             _selectionStart = start;
+            _captureClipboardSequences[session] = GetClipboardSequenceNumber();
             _frozenDesktop = (Bitmap)image.Clone();
             _overlay = new SelectionOverlay(_frozenDesktop, _desktopBounds, start, _language);
             _overlay.Show();
@@ -733,8 +1180,10 @@ namespace DuoClick
 
             long session = ++_nextTestSessionId;
             _selectionSessionId = session;
+            _selectionBatchEpoch = _batchEpoch;
             _desktopBounds = desktopBounds;
             _selectionStart = start;
+            _captureClipboardSequences[session] = GetClipboardSequenceNumber();
             _hasPendingFinish = false;
             return session;
         }
@@ -745,8 +1194,10 @@ namespace DuoClick
                 throw new InvalidOperationException("There is no selection to queue behind.");
 
             long session = ++_nextTestSessionId;
+            uint clipboardSequence = GetClipboardSequenceNumber();
+            _captureClipboardSequences[session] = clipboardSequence;
             _pendingStarts.Enqueue(new SelectionStartRequest(session, start,
-                desktopBounds, true));
+                desktopBounds, true, clipboardSequence, _batchEpoch));
             return session;
         }
 
@@ -773,23 +1224,64 @@ namespace DuoClick
             CompleteSelection(sessionId, end);
         }
 
+        internal void CancelSelectionForTesting(long sessionId)
+        {
+            CancelSelection(sessionId);
+        }
+
         internal void PublishCropForTesting(long sessionId, Bitmap image)
         {
             if (image == null)
                 throw new ArgumentNullException("image");
-            PublishCrop(sessionId, image);
+            if (!_captureBatch.Reserve(sessionId, image.Size))
+            {
+                _captureClipboardSequences.Remove(sessionId);
+                image.Dispose();
+                return;
+            }
+            if (!_captureClipboardSequences.ContainsKey(sessionId))
+                _captureClipboardSequences[sessionId] = GetClipboardSequenceNumber();
+            OnBatchChanged(false);
+            CompleteCrop(sessionId, image);
         }
 
-        private void PublishCrop(long sessionId, Bitmap image)
+        internal bool ReserveCaptureForTesting(long sessionId, Size size)
         {
-            if (_closing || sessionId < _latestClipboardSessionId)
+            bool reserved = _captureBatch.Reserve(sessionId, size);
+            if (reserved)
+            {
+                _captureClipboardSequences[sessionId] = GetClipboardSequenceNumber();
+                OnBatchChanged(false);
+            }
+            return reserved;
+        }
+
+        internal void CompleteReservedCropForTesting(long sessionId, Bitmap image)
+        {
+            if (image == null)
+                throw new ArgumentNullException("image");
+            CompleteCrop(sessionId, image);
+        }
+
+        private void CompleteCrop(long sessionId, Bitmap image)
+        {
+            if (_closing)
             {
                 image.Dispose();
                 return;
             }
 
-            _latestClipboardSessionId = sessionId;
-            _clipboardQueue.Enqueue(image);
+            CaptureBatchCompletionResult result = _captureBatch.Complete(sessionId, image);
+            if (result == CaptureBatchCompletionResult.IgnoredStale)
+            {
+                _captureClipboardSequences.Remove(sessionId);
+                return;
+            }
+
+            OnBatchChanged(true);
+            if (result == CaptureBatchCompletionResult.Rejected)
+                ShowNotice(AppLocalization.Get(_language, AppText.BatchTooLarge),
+                    ToolTipIcon.Warning);
         }
 
         protected override void Dispose(bool disposing)
@@ -811,21 +1303,28 @@ namespace DuoClick
             internal readonly Point Start;
             internal readonly Rectangle DesktopBounds;
             internal readonly bool WaitForTestCapture;
+            internal readonly uint ClipboardSequence;
+            internal readonly long BatchEpoch;
             internal bool HasCompletion;
             internal Point End;
 
-            internal SelectionStartRequest(long sessionId, Point start)
-                : this(sessionId, start, Rectangle.Empty, false)
+            internal SelectionStartRequest(long sessionId, Point start,
+                uint clipboardSequence, long batchEpoch)
+                : this(sessionId, start, Rectangle.Empty, false,
+                    clipboardSequence, batchEpoch)
             {
             }
 
             internal SelectionStartRequest(long sessionId, Point start,
-                Rectangle desktopBounds, bool waitForTestCapture)
+                Rectangle desktopBounds, bool waitForTestCapture,
+                uint clipboardSequence, long batchEpoch)
             {
                 SessionId = sessionId;
                 Start = start;
                 DesktopBounds = desktopBounds;
                 WaitForTestCapture = waitForTestCapture;
+                ClipboardSequence = clipboardSequence;
+                BatchEpoch = batchEpoch;
             }
 
             internal void SetCompletion(Point end)
@@ -838,17 +1337,22 @@ namespace DuoClick
         private sealed class ClipboardCopyQueue : IDisposable
         {
             private const int MaximumAttempts = 10;
-            private readonly Queue<Bitmap> _items = new Queue<Bitmap>();
+            private const string PublicationTokenFormat =
+                "DuoClick.BatchPublicationToken.1";
             private readonly WinFormsTimer _timer;
-            private readonly Action _onCopied;
+            private readonly Action<long, long, long, uint, uint> _onCopied;
             private readonly Action _onFailed;
+            private readonly Func<uint> _getClipboardSequence;
+            private PendingPublication _pending;
             private int _attempts;
             private bool _disposed;
 
-            internal ClipboardCopyQueue(Action onCopied, Action onFailed)
+            internal ClipboardCopyQueue(Action<long, long, long, uint, uint> onCopied,
+                Action onFailed, Func<uint> getClipboardSequence)
             {
                 _onCopied = onCopied;
                 _onFailed = onFailed;
+                _getClipboardSequence = getClipboardSequence;
                 _timer = new WinFormsTimer();
                 _timer.Interval = 100;
                 _timer.Tick += OnTimerTick;
@@ -856,10 +1360,11 @@ namespace DuoClick
 
             internal bool HasPendingItems
             {
-                get { return _items.Count > 0; }
+                get { return _pending != null; }
             }
 
-            internal void Enqueue(Bitmap image)
+            internal void Enqueue(Bitmap image, uint expectedClipboardSequence,
+                long boundarySessionId, long batchVersion, long requestId)
             {
                 if (_disposed)
                 {
@@ -867,9 +1372,21 @@ namespace DuoClick
                     return;
                 }
 
-                _items.Enqueue(image);
-                if (_items.Count == 1)
-                    AttemptCurrent();
+                CancelPending();
+                _pending = new PendingPublication(image, expectedClipboardSequence,
+                    boundarySessionId, batchVersion, requestId);
+                AttemptCurrent();
+            }
+
+            internal void CancelPending()
+            {
+                _timer.Stop();
+                if (_pending != null)
+                {
+                    _pending.Image.Dispose();
+                    _pending = null;
+                }
+                _attempts = 0;
             }
 
             private void OnTimerTick(object sender, EventArgs e)
@@ -880,16 +1397,25 @@ namespace DuoClick
 
             private void AttemptCurrent()
             {
-                if (_disposed || _items.Count == 0)
+                if (_disposed || _pending == null)
                     return;
 
+                PendingPublication publication = _pending;
+                if (_getClipboardSequence() != publication.ExpectedClipboardSequence)
+                {
+                    // A user's later clipboard copy invalidates this image and
+                    // every retry based on the earlier clipboard contents.
+                    CancelPending();
+                    return;
+                }
+
                 _attempts++;
-                Bitmap image = _items.Peek();
                 bool copied = false;
                 try
                 {
                     DataObject data = new DataObject();
-                    data.SetData(DataFormats.Bitmap, image);
+                    data.SetData(DataFormats.Bitmap, publication.Image);
+                    data.SetData(PublicationTokenFormat, false, publication.Token);
                     // Zero internal retries keeps OLE clipboard contention from
                     // blocking the hook-owning UI thread; the WinForms timer retries.
                     Clipboard.SetDataObject(data, true, 0, 0);
@@ -902,23 +1428,42 @@ namespace DuoClick
 
                 if (copied)
                 {
-                    image.Dispose();
-                    _items.Dequeue();
+                    uint writtenSequence = _getClipboardSequence();
+                    object token = null;
+                    try { token = Clipboard.GetData(PublicationTokenFormat); }
+                    catch (Exception) { }
+                    uint validatedSequence = _getClipboardSequence();
+                    // Sequence numbers have no fixed increment contract. Verify
+                    // our unique marker is still present and that no later owner
+                    // replaced the clipboard while it was being checked.
+                    if (!publication.Token.Equals(token as string) ||
+                        validatedSequence != writtenSequence)
+                    {
+                        CancelPending();
+                        return;
+                    }
+
+                    _pending = null;
+                    publication.Image.Dispose();
                     _attempts = 0;
-                    _onCopied();
-                    if (_items.Count > 0)
-                        _timer.Start();
+                    _onCopied(publication.BoundarySessionId, publication.BatchVersion,
+                        publication.RequestId, publication.ExpectedClipboardSequence,
+                        validatedSequence);
+                    return;
+                }
+
+                if (_getClipboardSequence() != publication.ExpectedClipboardSequence)
+                {
+                    CancelPending();
                     return;
                 }
 
                 if (_attempts >= MaximumAttempts)
                 {
-                    Bitmap failed = _items.Dequeue();
-                    failed.Dispose();
+                    _pending.Image.Dispose();
+                    _pending = null;
                     _attempts = 0;
                     _onFailed();
-                    if (_items.Count > 0)
-                        _timer.Start();
                 }
                 else
                 {
@@ -931,11 +1476,30 @@ namespace DuoClick
                 if (_disposed)
                     return;
 
+                CancelPending();
                 _disposed = true;
-                _timer.Stop();
                 _timer.Dispose();
-                while (_items.Count > 0)
-                    _items.Dequeue().Dispose();
+            }
+
+            private sealed class PendingPublication
+            {
+                internal readonly Bitmap Image;
+                internal readonly uint ExpectedClipboardSequence;
+                internal readonly long BoundarySessionId;
+                internal readonly long BatchVersion;
+                internal readonly long RequestId;
+                internal readonly string Token;
+
+                internal PendingPublication(Bitmap image, uint expectedClipboardSequence,
+                    long boundarySessionId, long batchVersion, long requestId)
+                {
+                    Image = image;
+                    ExpectedClipboardSequence = expectedClipboardSequence;
+                    BoundarySessionId = boundarySessionId;
+                    BatchVersion = batchVersion;
+                    RequestId = requestId;
+                    Token = Guid.NewGuid().ToString("N");
+                }
             }
         }
     }

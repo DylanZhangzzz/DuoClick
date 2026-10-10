@@ -39,9 +39,11 @@ namespace DuoClick.Tests
             Run("disabled input does not start a chord", DisabledInputDoesNotStartChord);
             Run("pause on second press prevents chord start", PauseOnSecondPressPreventsChordStart);
             Run("unmatched initial release is forwarded", UnmatchedInitialReleaseIsForwarded);
+            Run("paste shortcut state recognizes supported key edges", PasteShortcutStateRecognizesSupportedEdges);
             Run("selection geometry supports negative origins and reverse direction", GeometrySupportsNegativeOriginsAndReverseDirection);
             Run("selection geometry clips to desktop bounds", GeometryClipsToDesktopBounds);
             Run("selection minimum size is two pixels per side", GeometryEnforcesMinimumSize);
+            CaptureBatchTests.Run(Run);
             Run("localization catalog is complete and tray text fits Windows limits", LocalizationCatalogIsComplete);
             Run("language settings choose system default and persist selections", LanguageSettingsPersistSelections);
             Run("tray feedback restores ready or paused status", TrayFeedbackRestoresBaseStatus);
@@ -52,6 +54,12 @@ namespace DuoClick.Tests
             {
                 Run("live desktop capture returns a disposable bitmap", LiveDesktopCaptureSmoke);
                 Run("synthetic selection copies the expected crop and disposes overlay", SyntheticClipboardIntegrationSmoke);
+                Run("three synthetic crops stitch in selection order", ThreeSyntheticCropsStitchInSelectionOrder);
+                Run("matching paste shortcut resets group and preserves clipboard", MatchingPasteShortcutResetsGroupAndPreservesClipboard);
+                Run("unrelated clipboard change cannot reset the group", UnrelatedClipboardChangeDoesNotResetGroup);
+                Run("external clipboard update during capture is preserved", ExternalClipboardUpdateDuringCaptureIsPreserved);
+                Run("own publication does not stale a newer selection", OwnPublicationDoesNotStaleNewerSelection);
+                Run("canceled and too-small selections do not enter the batch", CanceledAndTooSmallSelectionsAreExcluded);
                 Run("completion before capture readiness uses the queued end point", CompletionBeforeCaptureReadySmoke);
                 Run("older queued crop cannot replace a newer session", OlderCropCannotReplaceNewerSession);
                 Run("queued next selection completes after the active capture", QueuedSelectionCompletionSurvivesActiveCapture);
@@ -73,13 +81,13 @@ namespace DuoClick.Tests
             };
             for (int i = 0; i < languages.Length; i++)
             {
-                Assert(AppLocalization.Get(languages[i], AppText.TooltipReady).Length <= 63,
+                Assert(FormatTooltip(languages[i], AppText.TooltipReady, "999+").Length <= 63,
                     "ready tooltip should fit NotifyIcon's text limit");
-                Assert(AppLocalization.Get(languages[i], AppText.TooltipPaused).Length <= 63,
+                Assert(FormatTooltip(languages[i], AppText.TooltipPaused, "999+").Length <= 63,
                     "paused tooltip should fit NotifyIcon's text limit");
-                Assert(AppLocalization.Get(languages[i], AppText.TooltipCopied).Length <= 63,
+                Assert(FormatTooltip(languages[i], AppText.TooltipCopied, "999+").Length <= 63,
                     "copied tooltip should fit NotifyIcon's text limit");
-                Assert(AppLocalization.Get(languages[i], AppText.TooltipFailed).Length <= 63,
+                Assert(FormatTooltip(languages[i], AppText.TooltipFailed, "999+").Length <= 63,
                     "failed tooltip should fit NotifyIcon's text limit");
             }
         }
@@ -120,25 +128,25 @@ namespace DuoClick.Tests
         private static void TrayFeedbackRestoresBaseStatus()
         {
             TrayStatusModel status = new TrayStatusModel(AppLanguage.English);
-            AssertEqual(AppLocalization.Get(AppLanguage.English, AppText.TooltipReady),
+            AssertEqual(FormatTooltip(AppLanguage.English, AppText.TooltipReady, "0"),
                 status.Text, "initial tray tooltip should explain the gesture");
             status.ShowCopied();
-            AssertEqual(AppLocalization.Get(AppLanguage.English, AppText.TooltipCopied),
+            AssertEqual(FormatTooltip(AppLanguage.English, AppText.TooltipCopied, "0"),
                 status.Text, "copy feedback should be visible temporarily");
             status.ClearFeedback();
-            AssertEqual(AppLocalization.Get(AppLanguage.English, AppText.TooltipReady),
+            AssertEqual(FormatTooltip(AppLanguage.English, AppText.TooltipReady, "0"),
                 status.Text, "copy feedback should restore ready status");
 
             status.SetPaused(true);
             status.ShowCopied();
-            AssertEqual(AppLocalization.Get(AppLanguage.English, AppText.TooltipCopied),
+            AssertEqual(FormatTooltip(AppLanguage.English, AppText.TooltipCopied, "0"),
                 status.Text, "copy feedback should appear while paused");
             status.ClearFeedback();
-            AssertEqual(AppLocalization.Get(AppLanguage.English, AppText.TooltipPaused),
+            AssertEqual(FormatTooltip(AppLanguage.English, AppText.TooltipPaused, "0"),
                 status.Text, "copy feedback should restore paused status");
             status.SetLanguage(AppLanguage.SimplifiedChinese);
-            AssertEqual(AppLocalization.Get(AppLanguage.SimplifiedChinese,
-                AppText.TooltipPaused), status.Text,
+            AssertEqual(FormatTooltip(AppLanguage.SimplifiedChinese,
+                AppText.TooltipPaused, "0"), status.Text,
                 "language switching should immediately localize the current status");
         }
 
@@ -167,12 +175,12 @@ namespace DuoClick.Tests
 
                 context.SetPausedForTesting(true);
                 context.ShowCopiedFeedbackForTesting();
-                AssertEqual(AppLocalization.Get(context.LanguageForTesting,
-                    AppText.TooltipCopied), context.TrayTooltipForTesting,
+                AssertEqual(FormatTooltip(context.LanguageForTesting,
+                    AppText.TooltipCopied, "0"), context.TrayTooltipForTesting,
                     "copy feedback should replace paused tooltip temporarily");
                 context.ClearTooltipFeedbackForTesting();
-                AssertEqual(AppLocalization.Get(context.LanguageForTesting,
-                    AppText.TooltipPaused), context.TrayTooltipForTesting,
+                AssertEqual(FormatTooltip(context.LanguageForTesting,
+                    AppText.TooltipPaused, "0"), context.TrayTooltipForTesting,
                     "clearing copy feedback should restore paused tooltip");
 
                 context.ChangeLanguageForTesting(AppLanguage.SimplifiedChinese);
@@ -180,8 +188,8 @@ namespace DuoClick.Tests
                     "language should change immediately");
                 AssertEqual("zh-CN", File.ReadAllText(path),
                     "language switch should persist in the selected settings path");
-                AssertEqual(AppLocalization.Get(AppLanguage.SimplifiedChinese,
-                    AppText.TooltipPaused), context.TrayTooltipForTesting,
+                AssertEqual(FormatTooltip(AppLanguage.SimplifiedChinese,
+                    AppText.TooltipPaused, "0"), context.TrayTooltipForTesting,
                     "language change should immediately localize current paused status");
             }
             finally
@@ -376,6 +384,44 @@ namespace DuoClick.Tests
             Assert(state.AllButtonsReleased, "unmatched release should leave state released");
         }
 
+        private static void PasteShortcutStateRecognizesSupportedEdges()
+        {
+            const int vKey = 0x56;
+            const int insertKey = 0x2D;
+            PasteShortcutState state = new PasteShortcutState();
+
+            Assert(state.Observe(vKey, true, false, true, false, false, false),
+                "Ctrl+V keydown should identify a paste shortcut");
+            Assert(!state.Observe(vKey, true, false, true, false, false, false),
+                "repeated Ctrl+V keydown should be ignored until keyup");
+            Assert(!state.Observe(vKey, false, true, false, false, false, false),
+                "Ctrl+V keyup should only clear the pressed state");
+            Assert(state.Observe(vKey, true, false, true, false, false, false),
+                "a new Ctrl+V edge after keyup should be recognized");
+
+            PasteShortcutState insertState = new PasteShortcutState();
+            Assert(insertState.Observe(insertKey, true, false, false, true, false, false),
+                "Shift+Insert keydown should identify a paste shortcut");
+
+            PasteShortcutState rejected = new PasteShortcutState();
+            Assert(!rejected.Observe(vKey, true, false, false, false, false, false),
+                "V without Ctrl should not be recognized");
+            Assert(!rejected.Observe(vKey, false, true, false, false, false, false),
+                "V release should reset key edge state");
+            Assert(!rejected.Observe(vKey, true, false, true, true, false, false),
+                "Ctrl+Shift+V should not be recognized as paste");
+            Assert(!rejected.Observe(vKey, false, true, false, false, false, false),
+                "V release should reset key edge state after modified shortcut");
+            Assert(!rejected.Observe(insertKey, true, false, true, true, false, false),
+                "Ctrl+Shift+Insert should not be recognized as paste");
+            Assert(!rejected.Observe(insertKey, false, true, false, false, false, false),
+                "Insert release should reset key edge state");
+            Assert(!rejected.Observe(vKey, true, false, true, false, true, false),
+                "Alt+Ctrl+V should not be recognized as paste");
+            Assert(!rejected.Observe(insertKey, true, false, false, true, false, true),
+                "Win+Shift+Insert should not be recognized as paste");
+        }
+
         private static void GeometrySupportsNegativeOriginsAndReverseDirection()
         {
             Rectangle bounds = new Rectangle(-1920, -100, 3840, 1180);
@@ -448,7 +494,7 @@ namespace DuoClick.Tests
             {
                 DataObject sentinel = new DataObject();
                 sentinel.SetData("DuoClick.TestSentinel", false, Guid.NewGuid().ToString("N"));
-                Clipboard.SetDataObject(sentinel, true, 0, 0);
+                SetClipboardForTesting(sentinel);
 
                 context = new DuoClickApplicationContext(false, false);
 
@@ -492,6 +538,366 @@ namespace DuoClick.Tests
             }
         }
 
+        private static void ThreeSyntheticCropsStitchInSelectionOrder()
+        {
+            List<IDisposable> clipboardSnapshotValues;
+            IDataObject originalClipboard = CaptureClipboardSnapshot(out clipboardSnapshotValues);
+            DuoClickApplicationContext context = null;
+            Bitmap copied = null;
+            try
+            {
+                DataObject sentinel = new DataObject();
+                sentinel.SetData("DuoClick.TestSentinel", false, Guid.NewGuid().ToString("N"));
+                SetClipboardForTesting(sentinel);
+
+                context = new DuoClickApplicationContext(false, false);
+                context.PublishCropForTesting(1, CreateSolidBitmap(4, 2, Color.Red));
+                context.PublishCropForTesting(2, CreateSolidBitmap(2, 3, Color.Green));
+                context.PublishCropForTesting(3, CreateSolidBitmap(3, 1, Color.Blue));
+
+                copied = WaitForExpectedClipboardBitmap(4, 6, TimeSpan.FromSeconds(10));
+                Assert(copied != null, "three accepted crops should create a 4 by 6 clipboard bitmap");
+                AssertEqual(3, context.BatchCountForTesting, "batch should retain all three captures");
+
+                for (int y = 0; y < copied.Height; y++)
+                {
+                    Color expected = y < 2 ? Color.Red : (y < 5 ? Color.Green : Color.Blue);
+                    for (int x = 0; x < copied.Width; x++)
+                    {
+                        Color expectedPixel = x < (y < 2 ? 4 : (y < 5 ? 2 : 3))
+                            ? expected : Color.White;
+                        AssertEqual(expectedPixel.ToArgb(), copied.GetPixel(x, y).ToArgb(),
+                            "stitched pixel " + x + "," + y);
+                    }
+                }
+            }
+            finally
+            {
+                if (copied != null)
+                    copied.Dispose();
+                if (context != null)
+                {
+                    context.ExitThread();
+                    context.Dispose();
+                }
+
+                try { RestoreClipboard(originalClipboard); }
+                finally { DisposeAll(clipboardSnapshotValues); }
+            }
+        }
+
+        private static void MatchingPasteShortcutResetsGroupAndPreservesClipboard()
+        {
+            List<IDisposable> clipboardSnapshotValues;
+            IDataObject originalClipboard = CaptureClipboardSnapshot(out clipboardSnapshotValues);
+            DuoClickApplicationContext context = null;
+            Bitmap published = null;
+            Bitmap preserved = null;
+            Bitmap nextBatch = null;
+            try
+            {
+                DataObject sentinel = new DataObject();
+                sentinel.SetData("DuoClick.TestSentinel", false, Guid.NewGuid().ToString("N"));
+                SetClipboardForTesting(sentinel);
+
+                context = new DuoClickApplicationContext(false, false);
+                context.PublishCropForTesting(1, CreateSolidBitmap(4, 2, Color.Red));
+                published = WaitForExpectedClipboardBitmap(4, 2, TimeSpan.FromSeconds(10));
+                Assert(published != null, "first capture should be published before reset");
+                AssertEqual(1, context.BatchCountForTesting, "first capture should be in the group");
+
+                uint publishedSequence = context.ClipboardSequenceForTesting;
+                context.ObservePasteShortcutForTesting(publishedSequence);
+                AssertEqual(0, context.BatchCountForTesting,
+                    "paste shortcut against the current published bitmap should reset the group");
+
+                preserved = WaitForExpectedClipboardBitmap(4, 2, TimeSpan.FromSeconds(1));
+                Assert(preserved != null, "reset should leave the published clipboard bitmap intact");
+                AssertBitmapsEqual(published, preserved, "clipboard pixels should survive reset");
+
+                context.PublishCropForTesting(2, CreateSolidBitmap(5, 1, Color.Blue));
+                nextBatch = WaitForExpectedClipboardBitmap(5, 1, TimeSpan.FromSeconds(10));
+                Assert(nextBatch != null, "next capture should publish as a one-capture group");
+                AssertEqual(1, context.BatchCountForTesting,
+                    "next group should contain only the capture made after reset");
+                for (int x = 0; x < nextBatch.Width; x++)
+                    AssertEqual(Color.Blue.ToArgb(), nextBatch.GetPixel(x, 0).ToArgb(),
+                        "next-group pixel " + x);
+            }
+            finally
+            {
+                if (published != null)
+                    published.Dispose();
+                if (preserved != null)
+                    preserved.Dispose();
+                if (nextBatch != null)
+                    nextBatch.Dispose();
+                if (context != null)
+                {
+                    context.ExitThread();
+                    context.Dispose();
+                }
+
+                try { RestoreClipboard(originalClipboard); }
+                finally { DisposeAll(clipboardSnapshotValues); }
+            }
+        }
+
+        private static void UnrelatedClipboardChangeDoesNotResetGroup()
+        {
+            List<IDisposable> clipboardSnapshotValues;
+            IDataObject originalClipboard = CaptureClipboardSnapshot(out clipboardSnapshotValues);
+            DuoClickApplicationContext context = null;
+            Bitmap published = null;
+            try
+            {
+                DataObject sentinel = new DataObject();
+                sentinel.SetData("DuoClick.TestSentinel", false, Guid.NewGuid().ToString("N"));
+                SetClipboardForTesting(sentinel);
+
+                context = new DuoClickApplicationContext(false, false);
+                context.PublishCropForTesting(1, CreateSolidBitmap(4, 2, Color.Red));
+                published = WaitForExpectedClipboardBitmap(4, 2, TimeSpan.FromSeconds(10));
+                Assert(published != null, "capture should be published before foreign clipboard update");
+                uint publishedSequence = context.ClipboardSequenceForTesting;
+
+                DataObject unrelated = new DataObject();
+                unrelated.SetData("DuoClick.UnrelatedClipboardData", false,
+                    Guid.NewGuid().ToString("N"));
+                SetClipboardForTesting(unrelated);
+                uint unrelatedSequence = context.ClipboardSequenceForTesting;
+                Assert(unrelatedSequence != publishedSequence,
+                    "unrelated clipboard write should advance the sequence number");
+                AssertEqual(1, context.BatchCountForTesting,
+                    "clipboard update without a paste shortcut should leave captures grouped");
+
+                context.ObservePasteShortcutForTesting(publishedSequence);
+                AssertEqual(1, context.BatchCountForTesting,
+                    "paste callback captured before a clipboard change should be ignored");
+                context.ObservePasteShortcutForTesting(unrelatedSequence);
+                AssertEqual(1, context.BatchCountForTesting,
+                    "paste callback for unrelated clipboard data should be ignored");
+            }
+            finally
+            {
+                if (published != null)
+                    published.Dispose();
+                if (context != null)
+                {
+                    context.ExitThread();
+                    context.Dispose();
+                }
+
+                try { RestoreClipboard(originalClipboard); }
+                finally { DisposeAll(clipboardSnapshotValues); }
+            }
+        }
+
+        private static void ExternalClipboardUpdateDuringCaptureIsPreserved()
+        {
+            List<IDisposable> clipboardSnapshotValues;
+            IDataObject originalClipboard = CaptureClipboardSnapshot(out clipboardSnapshotValues);
+            DuoClickApplicationContext context = null;
+            Bitmap externalImage = null;
+            Bitmap observedImage = null;
+            string stage = "initial clipboard setup";
+            try
+            {
+                DataObject sentinel = new DataObject();
+                sentinel.SetData("DuoClick.TestSentinel", false, Guid.NewGuid().ToString("N"));
+                SetClipboardForTesting(sentinel);
+
+                context = new DuoClickApplicationContext(false, false);
+                stage = "capture reservation";
+                Assert(context.ReserveCaptureForTesting(1, new Size(4, 2)),
+                    "capture should reserve its place before crop completion");
+
+                const string markerFormat = "DuoClick.UnrelatedClipboardData";
+                const string markerValue = "external clipboard update";
+                externalImage = CreateSolidBitmap(2, 2, Color.Orange);
+                DataObject unrelated = new DataObject();
+                unrelated.SetData(DataFormats.Bitmap, externalImage);
+                unrelated.SetData(markerFormat, false, markerValue);
+                stage = "external clipboard write";
+                SetClipboardForTesting(unrelated);
+
+                stage = "crop completion and asynchronous composition";
+                context.CompleteReservedCropForTesting(1,
+                    CreateSolidBitmap(4, 2, Color.Red));
+
+                DateTime deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+                stage = "composition completion";
+                while (context.HasPendingClipboardCopyForTesting && DateTime.UtcNow < deadline)
+                {
+                    Application.DoEvents();
+                    Thread.Sleep(10);
+                }
+                Application.DoEvents();
+                Assert(!context.HasPendingClipboardCopyForTesting,
+                    "capture composition should finish or be discarded within the timeout");
+                AssertEqual(1, context.BatchCountForTesting,
+                    "external clipboard update should not discard the completed capture");
+
+                stage = "external clipboard verification";
+                IDataObject current = Clipboard.GetDataObject();
+                Assert(current != null && current.GetDataPresent(markerFormat),
+                    "capture completion should not replace unrelated clipboard data");
+                AssertEqual(markerValue, (string)current.GetData(markerFormat, false),
+                    "external clipboard marker should remain available");
+                observedImage = current.GetData(DataFormats.Bitmap, false) as Bitmap;
+                Assert(observedImage != null, "external bitmap should remain on the clipboard");
+                AssertEqual(Color.Orange.ToArgb(), observedImage.GetPixel(1, 1).ToArgb(),
+                    "external bitmap pixel should remain intact");
+            }
+            catch (Exception exception)
+            {
+                throw new Exception(stage + ": " + exception.Message);
+            }
+            finally
+            {
+                if (observedImage != null)
+                    observedImage.Dispose();
+                if (context != null)
+                {
+                    context.ExitThread();
+                    context.Dispose();
+                }
+
+                try { RestoreClipboard(originalClipboard); }
+                finally
+                {
+                    if (externalImage != null)
+                        externalImage.Dispose();
+                    DisposeAll(clipboardSnapshotValues);
+                }
+            }
+        }
+
+        private static void OwnPublicationDoesNotStaleNewerSelection()
+        {
+            List<IDisposable> clipboardSnapshotValues;
+            IDataObject originalClipboard = CaptureClipboardSnapshot(out clipboardSnapshotValues);
+            DuoClickApplicationContext context = null;
+            Bitmap firstPublished = null;
+            Bitmap combined = null;
+            try
+            {
+                DataObject sentinel = new DataObject();
+                sentinel.SetData("DuoClick.TestSentinel", false, Guid.NewGuid().ToString("N"));
+                SetClipboardForTesting(sentinel);
+
+                context = new DuoClickApplicationContext(false, false);
+                context.PublishCropForTesting(1, CreateSolidBitmap(4, 2, Color.Red));
+
+                Rectangle bounds = new Rectangle(-100, -50, 12, 10);
+                Point start = new Point(-98, -48);
+                Point end = new Point(-95, -45);
+                long nextSession = context.BeginPendingSelectionForTesting(bounds, start);
+
+                // The next selection records the current clipboard sequence before
+                // the first composition is allowed to publish.
+                firstPublished = WaitForExpectedClipboardBitmap(4, 2, TimeSpan.FromSeconds(10));
+                Assert(firstPublished != null,
+                    "first composition should publish while next capture is active");
+
+                context.CompleteSelectionForTesting(nextSession, end);
+                using (Bitmap source = CreateSolidBitmap(bounds.Width, bounds.Height, Color.Green))
+                    context.CompleteCaptureForTesting(nextSession, bounds, source);
+
+                combined = WaitForExpectedClipboardBitmap(4, 5, TimeSpan.FromSeconds(10));
+                Assert(combined != null,
+                    "the active selection should publish after the app's own earlier clipboard write");
+                AssertEqual(2, context.BatchCountForTesting,
+                    "both the first capture and active selection should remain grouped");
+                for (int y = 0; y < combined.Height; y++)
+                {
+                    for (int x = 0; x < combined.Width; x++)
+                    {
+                        Color expected = y < 2
+                            ? Color.Red
+                            : (x < 3 ? Color.Green : Color.White);
+                        AssertEqual(expected.ToArgb(), combined.GetPixel(x, y).ToArgb(),
+                            "rebased composite pixel " + x + "," + y);
+                    }
+                }
+            }
+            finally
+            {
+                if (firstPublished != null)
+                    firstPublished.Dispose();
+                if (combined != null)
+                    combined.Dispose();
+                if (context != null)
+                {
+                    context.ExitThread();
+                    context.Dispose();
+                }
+
+                try { RestoreClipboard(originalClipboard); }
+                finally { DisposeAll(clipboardSnapshotValues); }
+            }
+        }
+
+        private static void CanceledAndTooSmallSelectionsAreExcluded()
+        {
+            List<IDisposable> clipboardSnapshotValues;
+            IDataObject originalClipboard = CaptureClipboardSnapshot(out clipboardSnapshotValues);
+            DuoClickApplicationContext context = null;
+            try
+            {
+                const string markerFormat = "DuoClick.TestSentinel";
+                const string markerValue = "keep clipboard";
+                DataObject sentinel = new DataObject();
+                sentinel.SetData(markerFormat, false, markerValue);
+                SetClipboardForTesting(sentinel);
+
+                context = new DuoClickApplicationContext(false, false);
+                Rectangle bounds = new Rectangle(-100, -50, 12, 10);
+                Point start = new Point(-96, -47);
+                using (Bitmap source = CreatePatternBitmap(bounds.Size))
+                {
+                    long cancelledSession = context.BeginSelectionWithImageForTesting(
+                        source, bounds, start);
+                    context.CancelSelectionForTesting(cancelledSession);
+                }
+                AssertEqual(0, context.BatchCountForTesting,
+                    "canceling before completion should leave the batch empty");
+                Assert(!context.HasSelectionOverlayForTesting,
+                    "canceling should dispose the selection overlay");
+
+                using (Bitmap source = CreatePatternBitmap(bounds.Size))
+                {
+                    long tinySession = context.BeginSelectionWithImageForTesting(
+                        source, bounds, start);
+                    context.CompleteSelectionForTesting(tinySession,
+                        new Point(start.X + 1, start.Y + 1));
+                }
+                AssertEqual(0, context.BatchCountForTesting,
+                    "a one by one selection should not be added to the batch");
+                Assert(!context.HasSelectionOverlayForTesting,
+                    "rejecting a too-small selection should dispose the overlay");
+
+                IDataObject current = Clipboard.GetDataObject();
+                Assert(current != null && current.GetDataPresent(markerFormat),
+                    "invalid selections should leave the clipboard untouched");
+                AssertEqual(markerValue, (string)current.GetData(markerFormat, false),
+                    "clipboard marker should survive canceled and too-small selections");
+                Assert(!current.GetDataPresent(DataFormats.Bitmap),
+                    "invalid selections should not publish a screenshot");
+            }
+            finally
+            {
+                if (context != null)
+                {
+                    context.ExitThread();
+                    context.Dispose();
+                }
+
+                try { RestoreClipboard(originalClipboard); }
+                finally { DisposeAll(clipboardSnapshotValues); }
+            }
+        }
+
         private static void CompletionBeforeCaptureReadySmoke()
         {
             List<IDisposable> clipboardSnapshotValues;
@@ -502,7 +908,7 @@ namespace DuoClick.Tests
             {
                 DataObject sentinel = new DataObject();
                 sentinel.SetData("DuoClick.TestSentinel", false, Guid.NewGuid().ToString("N"));
-                Clipboard.SetDataObject(sentinel, true, 0, 0);
+                SetClipboardForTesting(sentinel);
 
                 context = new DuoClickApplicationContext(false, false);
                 Rectangle bounds = new Rectangle(-100, -50, 12, 10);
@@ -556,7 +962,7 @@ namespace DuoClick.Tests
             {
                 DataObject sentinel = new DataObject();
                 sentinel.SetData("DuoClick.TestSentinel", false, Guid.NewGuid().ToString("N"));
-                Clipboard.SetDataObject(sentinel, true, 0, 0);
+                SetClipboardForTesting(sentinel);
 
                 context = new DuoClickApplicationContext(false, false);
 
@@ -595,7 +1001,7 @@ namespace DuoClick.Tests
             {
                 DataObject sentinel = new DataObject();
                 sentinel.SetData("DuoClick.TestSentinel", false, Guid.NewGuid().ToString("N"));
-                Clipboard.SetDataObject(sentinel, true, 0, 0);
+                SetClipboardForTesting(sentinel);
 
                 context = new DuoClickApplicationContext(false, false);
                 Rectangle firstBounds = new Rectangle(-100, -50, 12, 10);
@@ -621,12 +1027,21 @@ namespace DuoClick.Tests
 
                 Assert(!context.HasSelectionOverlayForTesting,
                     "both completed selections should release their overlays");
-                copied = WaitForExpectedClipboardBitmap(4, 3, TimeSpan.FromSeconds(10));
-                Assert(copied != null, "queued selection B crop should reach the clipboard");
-                AssertEqual(Color.Green.ToArgb(), copied.GetPixel(0, 0).ToArgb(),
-                    "queued B should publish its own crop");
-                AssertEqual(Color.Green.ToArgb(), copied.GetPixel(3, 2).ToArgb(),
-                    "queued B should remain the latest crop");
+                copied = WaitForExpectedClipboardBitmap(6, 9, TimeSpan.FromSeconds(10));
+                Assert(copied != null, "queued captures should produce a vertically stitched bitmap");
+                AssertEqual(2, context.BatchCountForTesting,
+                    "both queued selections should remain in the batch");
+                for (int y = 0; y < copied.Height; y++)
+                {
+                    for (int x = 0; x < copied.Width; x++)
+                    {
+                        Color expected = y < 6
+                            ? PatternColor(x + 4, y + 3)
+                            : (x < 4 ? Color.Green : Color.White);
+                        AssertEqual(expected.ToArgb(), copied.GetPixel(x, y).ToArgb(),
+                            "queued composite pixel " + x + "," + y);
+                    }
+                }
             }
             finally
             {
@@ -699,6 +1114,18 @@ namespace DuoClick.Tests
                     image.SetPixel(x, y, color);
             }
             return image;
+        }
+
+        private static void AssertBitmapsEqual(Bitmap expected, Bitmap actual, string message)
+        {
+            AssertEqual(expected.Width, actual.Width, message + " width");
+            AssertEqual(expected.Height, actual.Height, message + " height");
+            for (int y = 0; y < expected.Height; y++)
+            {
+                for (int x = 0; x < expected.Width; x++)
+                    AssertEqual(expected.GetPixel(x, y).ToArgb(), actual.GetPixel(x, y).ToArgb(),
+                        message + " pixel " + x + "," + y);
+            }
         }
 
         private static Color PatternColor(int x, int y)
@@ -822,9 +1249,30 @@ namespace DuoClick.Tests
         private static void RestoreClipboard(IDataObject originalClipboard)
         {
             if (originalClipboard == null)
-                Clipboard.Clear();
+            {
+                ExternalException lastError = null;
+                for (int attempt = 0; attempt < 10; attempt++)
+                {
+                    try
+                    {
+                        Clipboard.Clear();
+                        return;
+                    }
+                    catch (ExternalException exception)
+                    {
+                        lastError = exception;
+                        Thread.Sleep(50);
+                    }
+                }
+                throw lastError;
+            }
             else
-                Clipboard.SetDataObject(originalClipboard, true, 10, 50);
+                SetClipboardForTesting(originalClipboard);
+        }
+
+        private static void SetClipboardForTesting(IDataObject data)
+        {
+            Clipboard.SetDataObject(data, true, 10, 50);
         }
 
         private static void DisposeAll(List<IDisposable> values)
@@ -846,6 +1294,12 @@ namespace DuoClick.Tests
             AssertEqual(sessionId, transition.SessionId, name + " session id");
             AssertEqual(x, transition.X, name + " X");
             AssertEqual(y, transition.Y, name + " Y");
+        }
+
+        private static string FormatTooltip(AppLanguage language, AppText text, string count)
+        {
+            return String.Format(CultureInfo.InvariantCulture,
+                AppLocalization.Get(language, text), count);
         }
 
         private static void Assert(bool condition, string message)
